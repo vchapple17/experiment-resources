@@ -1,7 +1,7 @@
 # Backend Service & Data Model Design
 ## Multi-Tenant SaaS — Capacity-Constrained Ordering Platform
 
-**Status:** Draft — v3
+**Status:** Draft — v4
 **Date:** 2026-03-19
 **Stack:** Python (FastAPI), PostgreSQL, Service + Repository pattern
 
@@ -23,10 +23,13 @@ items require the customer to select an available pickup window.
 ### Goals
 
 - Isolate each company's data, staff, products, schedules, and orders completely
-- Support a single user belonging to multiple companies (e.g. an owner with two shops)
-- Provide a platform-level admin role for the SaaS operator
+- Support a single user belonging to multiple companies with per-company roles and a company switcher
+- Support multiple **locations** per company, each inheriting company-level templates with the ability to override
+- Share products (menu) across all locations within a company; locations can hide products they don't carry
+- Provide a platform-level admin role for the SaaS operator; platform admins can promote other platform admins
 - Handle both ready and made-to-order products in the same order flow
-- Email confirmation on order placement
+- Per-company and per-location kill switch to stop accepting orders instantly
+- Email notifications across the full order lifecycle
 
 ---
 
@@ -136,11 +139,34 @@ Each tenant on the platform.
 | `internal_name` | VARCHAR(100) UNIQUE | Short identifier for platform admin ops, e.g. "JDBAKERY" |
 | `slug` | VARCHAR(100) UNIQUE | URL/subdomain identifier, e.g. `jds-bakery` → `jds-bakery.yourapp.com` |
 | `is_active` | BOOLEAN | Platform admin can suspend a company |
+| `is_accepting_orders` | BOOLEAN | **Global kill switch** — when false, all locations stop accepting orders |
 | `created_at` | TIMESTAMPTZ | |
 
 **Display name rule:** use `dba_name` if set, otherwise fall back to `legal_name`.
 `internal_name` is never shown to customers or company staff — platform admin only.
 `slug` is URL-safe, lowercase, hyphenated; used for subdomain or path routing.
+
+#### `locations`
+A physical storefront or location belonging to a company. Inherits company-level
+templates but can override schedule and product availability independently.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `company_id` | UUID FK → `companies` | |
+| `name` | VARCHAR(255) | e.g. "Downtown", "Northside" |
+| `address` | TEXT | Full street address |
+| `phone` | VARCHAR(50) NULLABLE | Location-specific contact |
+| `timezone` | VARCHAR(100) | e.g. `America/Chicago` — critical for schedule windows |
+| `schedule_template_id` | UUID FK → `schedule_templates` NULLABLE | NULL = use company's active template |
+| `is_active` | BOOLEAN | |
+| `is_accepting_orders` | BOOLEAN | **Per-location kill switch** — overrides company setting when false |
+| `created_at` | TIMESTAMPTZ | |
+
+**Kill switch hierarchy:**
+- `company.is_accepting_orders = false` → all locations closed, regardless of location setting
+- `location.is_accepting_orders = false` → only that location closed
+- Both must be `true` for a location to accept orders
 
 #### `users`
 Platform-level accounts. Role and company association live in `company_memberships`.
@@ -169,7 +195,8 @@ Links users to companies with a role. A user can have one membership per company
 | — | UNIQUE(`user_id`, `company_id`) | One membership per company per user |
 
 #### `products`
-Tenant-scoped. Two types: ready-to-sell or made-to-order.
+Defined at the **company level** and shared across all locations. A location cannot
+create its own products — it can only show/hide company products via `location_product_overrides`.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -180,11 +207,26 @@ Tenant-scoped. Two types: ready-to-sell or made-to-order.
 | `description` | TEXT | |
 | `price_cents` | INTEGER | Stored in cents |
 | `product_type` | ENUM(`ready`, `made_to_order`) | Controls ordering flow |
-| `is_active` | BOOLEAN | Permanently removed when false |
-| `is_on_hold` | BOOLEAN | Temporarily hidden; staff can resume |
+| `is_active` | BOOLEAN | Permanently removed when false — affects all locations |
+| `is_on_hold` | BOOLEAN | Temporarily hidden company-wide; staff can resume |
 | `image_url` | TEXT NULLABLE | |
 | `created_at` | TIMESTAMPTZ | |
 | `updated_at` | TIMESTAMPTZ | |
+
+#### `location_product_overrides`
+Allows a location to hide a product it doesn't carry, without affecting other locations.
+By default, all active company products are available at all locations.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `location_id` | UUID FK → `locations` | |
+| `product_id` | UUID FK → `products` | |
+| `is_available` | BOOLEAN | false = hidden at this location only |
+| — | UNIQUE(`location_id`, `product_id`) | One override per product per location |
+
+**Visibility rule for a product at a location:**
+`product.is_active AND NOT product.is_on_hold AND (no override OR override.is_available = true)`
 
 #### `categories`
 Tenant-scoped groupings (e.g. Breads, Pastries, Beverages).
@@ -197,15 +239,17 @@ Tenant-scoped groupings (e.g. Breads, Pastries, Beverages).
 | `sort_order` | INTEGER | |
 
 #### `schedule_templates`
-Tenant-scoped weekly repeating production schedule. Applies only to `made_to_order`
-products.
+Company-level weekly repeating production schedule. Applies only to `made_to_order`
+products. A company can have multiple templates (e.g. "Standard Week", "Holiday Schedule").
+Locations reference a template; if no template is assigned to a location, the company's
+active default template is used.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
-| `company_id` | UUID FK → `companies` | |
+| `company_id` | UUID FK → `companies` | All templates belong to a company |
 | `name` | VARCHAR(100) | e.g. "Standard Week", "Holiday Schedule" |
-| `is_active` | BOOLEAN | Only one active per company at a time |
+| `is_default` | BOOLEAN | Company's fallback template when a location has none assigned |
 | `created_at` | TIMESTAMPTZ | |
 
 #### `schedule_template_slots`
@@ -231,18 +275,20 @@ How many of each made-to-order product can be produced per template slot.
 | `max_quantity` | INTEGER | |
 
 #### `availability_windows`
-Concrete calendar-date instances generated from the active template.
-Staff can block a window (holiday) or adjust per day.
+Concrete calendar-date instances generated per **location** from the template assigned
+to that location (or the company default). Staff can block a window or adjust per day
+at the location level without affecting other locations.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
-| `company_id` | UUID FK → `companies` | |
+| `company_id` | UUID FK → `companies` | For fast filtering |
+| `location_id` | UUID FK → `locations` | Windows are per-location |
 | `template_slot_id` | UUID FK → `schedule_template_slots` NULLABLE | NULL if manually created |
 | `date` | DATE | |
 | `pickup_start` | TIMESTAMPTZ | |
 | `pickup_end` | TIMESTAMPTZ | |
-| `is_blocked` | BOOLEAN | Staff can close (holiday, early sellout) |
+| `is_blocked` | BOOLEAN | Staff can close (holiday, early sellout) at this location |
 | `created_at` | TIMESTAMPTZ | |
 
 #### `window_product_capacity`
@@ -258,13 +304,14 @@ staff can override per day.
 | `reserved_quantity` | INTEGER | Atomically incremented on order placement |
 
 #### `orders`
-A customer's purchase. May contain both ready and made-to-order items.
-Payment collected in person.
+A customer's purchase at a specific location. May contain both ready and made-to-order
+items. Payment collected in person.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
 | `company_id` | UUID FK → `companies` | |
+| `location_id` | UUID FK → `locations` | Which location the order is for |
 | `customer_id` | UUID FK → `users` | |
 | `status` | ENUM(`pending`, `confirmed`, `ready`, `completed`, `cancelled`) | |
 | `total_cents` | INTEGER | Reference only until in-person payment |
@@ -289,20 +336,27 @@ Payment collected in person.
 
 ```
 companies ──< company_memberships >── users
+    │               (is_accepting_orders = company kill switch)
     │
     ├──< categories
     │
-    ├──< products (type: ready | made_to_order)
+    ├──< products (company-level, shared across locations)
     │         │
-    ├──< schedule_templates
+    ├──< schedule_templates (company-level, locations reference one)
     │         └──< schedule_template_slots >──< product_slot_capacity >── products
-    │                        │
-    │                        ▼ (generated)
-    └──< availability_windows >──< window_product_capacity >── products
-                   │
-              orders (pickup_window_id nullable)
-                │  └──< order_items >── products
-               users
+    │
+    └──< locations (is_accepting_orders = location kill switch)
+              │   └──< location_product_overrides >── products
+              │         (hide products not carried at this location)
+              │
+              │   schedule_template_id → schedule_templates
+              │         (inherit company default or assign own)
+              │
+              └──< availability_windows >──< window_product_capacity >── products
+                             │
+                        orders (location_id + pickup_window_id)
+                          └──< order_items >── products
+                         customer (users)
 ```
 
 ---
@@ -341,23 +395,46 @@ POST   /auth/select-company/{company_id} # Exchange for scoped JWT
 POST   /auth/refresh
 ```
 
-### Companies (platform admin only)
+### Platform Admin [is_platform_admin only]
 ```
 GET    /platform/companies               # List all tenants
-POST   /platform/companies               # Create new company
+POST   /platform/companies               # Create new company (triggers onboarding)
 GET    /platform/companies/{id}
-PATCH  /platform/companies/{id}          # Suspend, rename
+PATCH  /platform/companies/{id}          # Update names, slug, status, kill switch
+GET    /platform/companies/{id}/billing
+PUT    /platform/companies/{id}/billing
+
 GET    /platform/users                   # All platform users
+PATCH  /platform/users/{id}/promote      # Grant is_platform_admin
+PATCH  /platform/users/{id}/demote       # Revoke is_platform_admin
 ```
 
-### Company Onboarding / Members [admin]
+### Company Management [admin]
 ```
-GET    /company/profile                  # Current company details
-PATCH  /company/profile                  # Update name, slug
-GET    /company/members                  # List staff + customers
-POST   /company/members                  # Invite user by email
-PATCH  /company/members/{user_id}        # Change role
-DELETE /company/members/{user_id}        # Remove from company
+GET    /company/profile
+PATCH  /company/profile                            # Update name, slug
+PATCH  /company/profile/orders/toggle              # Toggle is_accepting_orders (kill switch)
+
+GET    /company/members                            # List staff + customers
+POST   /company/members                            # Invite staff by email
+PATCH  /company/members/{user_id}                  # Change role
+DELETE /company/members/{user_id}                  # Remove from company
+
+GET    /company/customers                          # List customer accounts
+PATCH  /company/customers/{user_id}                # Edit customer (flag, notes)
+DELETE /company/customers/{user_id}                # Remove customer account
+```
+
+### Locations [admin]
+```
+GET    /locations                                  # List company locations
+POST   /locations                                  # Create location
+GET    /locations/{id}
+PUT    /locations/{id}                             # Update details
+PATCH  /locations/{id}/orders/toggle               # Toggle location kill switch [staff+]
+PATCH  /locations/{id}/schedule                    # Assign a schedule template
+GET    /locations/{id}/products                    # Products with override status
+PATCH  /locations/{id}/products/{product_id}       # Set is_available override [staff+]
 ```
 
 ### Products
@@ -394,11 +471,11 @@ POST   /schedules/{id}/slots/{slot_id}/capacity
 
 ### Availability Windows
 ```
-GET    /availability                            # By date range (public)
-POST   /availability/generate                  # Generate from template [staff+]
-PATCH  /availability/{id}                      # Block/unblock day [staff+]
-GET    /availability/{id}/capacity
-PATCH  /availability/{id}/capacity/{product_id} # Override qty [staff+]
+GET    /locations/{id}/availability                        # Windows for a location by date range (public)
+POST   /locations/{id}/availability/generate               # Generate from assigned template [staff+]
+PATCH  /locations/{id}/availability/{window_id}            # Block/unblock a day [staff+]
+GET    /locations/{id}/availability/{window_id}/capacity
+PATCH  /locations/{id}/availability/{window_id}/capacity/{product_id}  # Override qty [staff+]
 ```
 
 ### Orders
@@ -473,6 +550,11 @@ Ready items have no capacity check — they are added to the order freely.
 | 16 | Auth provider | Clerk — Organizations map to companies; roles stored in org membership metadata to avoid $100/month add-on; Pro plan ($25/month) |
 | 17 | Customer registration | Per-company via storefront slug; same email can exist at multiple companies independently |
 | 18 | Billing model | Flat monthly tiers (Trial free / Starter $29 / Pro $79); gated by staff seats, product count, template count |
+| 19 | Locations | Companies support multiple locations; products are company-level (shared); schedules and availability windows are per-location |
+| 20 | Template inheritance | Company defines default schedule template; locations can assign their own or inherit default |
+| 21 | Product visibility | Locations can hide company products via `location_product_overrides`; cannot create location-only products |
+| 22 | Kill switch | Two-level: company (global) and location (local); both must be true to accept orders |
+| 23 | Platform admin management | Platform admins can promote/demote other platform admins via `/platform/users/{id}/promote` |
 | 9 | User–company relationship | Many-to-many via `company_memberships`; role is per-company |
 | 10 | Tenant identification | Scoped JWT with `company_id` + `role` claims |
 | 11 | Platform admin | `is_platform_admin` flag on `users`; separate `/platform/*` endpoints |
@@ -490,37 +572,41 @@ app/
 │   ├── security.py         # JWT, password hashing, company context
 │   └── database.py         # SQLAlchemy engine & session
 ├── models/
-│   ├── company.py          # companies, company_memberships
+│   ├── company.py          # companies, company_memberships, company_billing
+│   ├── location.py         # locations, location_product_overrides
 │   ├── user.py
 │   ├── product.py          # products, categories
 │   ├── order.py            # orders, order_items
 │   └── schedule.py         # templates, slots, windows, capacity
 ├── schemas/
 │   ├── company.py
+│   ├── location.py
 │   ├── user.py
 │   ├── product.py
 │   ├── order.py
 │   └── schedule.py
 ├── repositories/
 │   ├── company_repo.py
+│   ├── location_repo.py
 │   ├── user_repo.py
 │   ├── product_repo.py
 │   ├── order_repo.py
 │   └── schedule_repo.py
 ├── services/
 │   ├── auth_service.py       # Login, company selection, JWT issuance
-│   ├── company_service.py
+│   ├── company_service.py    # Company + platform admin management
+│   ├── location_service.py   # Location CRUD, kill switch, product overrides
 │   ├── product_service.py
-│   ├── order_service.py      # Handles mixed ready + made-to-order carts
-│   └── schedule_service.py   # Window generation + capacity enforcement
+│   ├── order_service.py      # Mixed ready + made-to-order carts, kill switch check
+│   └── schedule_service.py   # Window generation (per-location) + capacity enforcement
 ├── routers/
 │   ├── auth.py
-│   ├── platform.py           # Platform admin routes
-│   ├── company.py            # Company profile + member management
+│   ├── platform.py           # Platform admin: companies, promote/demote admins
+│   ├── company.py            # Company profile, members, customers
+│   ├── locations.py          # Location CRUD, kill switch, product overrides, availability
 │   ├── products.py
 │   ├── categories.py
 │   ├── schedules.py
-│   ├── availability.py
 │   └── orders.py
 └── migrations/               # Alembic
 ```
