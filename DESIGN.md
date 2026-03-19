@@ -82,12 +82,14 @@ Each tenant on the platform.
 | `id` | UUID PK | |
 | `legal_name` | VARCHAR(255) | Registered legal entity, e.g. "John Doe, LLC" |
 | `dba_name` | VARCHAR(255) NULLABLE | Customer-facing trade name, e.g. "JD's Bakery" |
-| `internal_name` | VARCHAR(100) UNIQUE | Short identifier used by platform admin, e.g. "JDBAKERY" |
+| `internal_name` | VARCHAR(100) UNIQUE | Short identifier for platform admin ops, e.g. "JDBAKERY" |
+| `slug` | VARCHAR(100) UNIQUE | URL/subdomain identifier, e.g. `jds-bakery` → `jds-bakery.yourapp.com` |
 | `is_active` | BOOLEAN | Platform admin can suspend a company |
 | `created_at` | TIMESTAMPTZ | |
 
 **Display name rule:** use `dba_name` if set, otherwise fall back to `legal_name`.
-The `internal_name` is never shown to customers or company staff — platform admin only.
+`internal_name` is never shown to customers or company staff — platform admin only.
+`slug` is URL-safe, lowercase, hyphenated; used for subdomain or path routing.
 
 #### `users`
 Platform-level accounts. Role and company association live in `company_memberships`.
@@ -414,7 +416,9 @@ Ready items have no capacity check — they are added to the order freely.
 | 6 | Deployment | Railway recommended (see Section 11) |
 | 7 | Admin UI | Single frontend, role-based routing |
 | 8 | Multi-tenancy | Row-level; `company_id` on all tenant tables |
-| 13 | Company naming | Three fields: `legal_name`, `dba_name` (customer-facing), `internal_name` (platform admin only) |
+| 13 | Company naming | `legal_name`, `dba_name` (customer-facing), `internal_name` (platform admin only), `slug` (URL/subdomain) |
+| 14 | Platform admin onboarding | Dedicated super admin dashboard + `company_billing` table for billing/plan tracking |
+| 15 | Backup & recovery | Railway automated snapshots + transactional writes + idempotent generation (see Section 13) |
 | 9 | User–company relationship | Many-to-many via `company_memberships`; role is per-company |
 | 10 | Tenant identification | Scoped JWT with `company_id` + `role` claims |
 | 11 | Platform admin | `is_platform_admin` flag on `users`; separate `/platform/*` endpoints |
@@ -506,13 +510,82 @@ A single transactional email on order confirmation.
 
 ---
 
-## 12. Next Steps
+## 12. Platform Admin — Company Onboarding
+
+> **TODO:** Build a dedicated super admin dashboard for onboarding and managing companies.
+
+This is separate from the company-facing UI. Only `is_platform_admin` users can access it.
+
+### Onboarding Flow (manual for now)
+1. Platform admin creates the company record via the dashboard
+2. Fills in all name fields, slug, and billing details
+3. Creates the first `admin` membership (invites the business owner by email)
+4. Company admin takes over from there (products, schedules, staff)
+
+### `company_billing`
+Stores billing and contact information visible only to the platform admin.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `company_id` | UUID FK → `companies` UNIQUE | One billing record per company |
+| `billing_email` | VARCHAR(255) | Invoice recipient |
+| `billing_address` | TEXT NULLABLE | Full mailing address |
+| `plan` | ENUM(`trial`, `starter`, `pro`) | Subscription tier (expand as needed) |
+| `plan_started_at` | DATE NULLABLE | |
+| `trial_ends_at` | DATE NULLABLE | |
+| `stripe_customer_id` | VARCHAR(255) NULLABLE | For future online billing |
+| `notes` | TEXT NULLABLE | Internal notes — payment history, special terms, support context |
+| `created_at` | TIMESTAMPTZ | |
+| `updated_at` | TIMESTAMPTZ | |
+
+### Platform Admin API (future dashboard)
+```
+GET    /platform/companies                  # List + search all companies
+POST   /platform/companies                  # Onboard new company
+GET    /platform/companies/{id}             # Full detail incl. billing
+PATCH  /platform/companies/{id}             # Update names, slug, status
+GET    /platform/companies/{id}/billing     # Billing record
+PUT    /platform/companies/{id}/billing     # Update billing info
+PATCH  /platform/companies/{id}/suspend     # Suspend/unsuspend
+GET    /platform/users                      # All platform users
+GET    /platform/orders                     # Cross-company order visibility (support)
+```
+
+---
+
+## 13. Backup & Failure Recovery
+
+> **TODO:** Define and implement backup strategy before going to production.
+
+### Database Backups
+- **Railway/Render** provide automated daily PostgreSQL snapshots — verify retention period (aim for 7–30 days)
+- Enable **point-in-time recovery (PITR)** if the hosting provider supports it
+- Periodically test restores — a backup that has never been restored is unverified
+
+### Application-Level Concerns
+- **Capacity reservation failures:** If an order is inserted but the email fails, the order is still valid. A staff-facing order list is the fallback — never depend solely on email.
+- **Partial order writes:** All order + capacity updates happen in a single DB transaction; a crash mid-request leaves no partial state.
+- **Idempotent window generation:** `POST /availability/generate` skips existing windows, so re-running after a failure is safe.
+
+### Future Hardening
+- [ ] Database replication / read replica for reporting queries
+- [ ] Automated backup restore test (monthly)
+- [ ] Health check endpoint (`GET /health`) for uptime monitoring (e.g. UptimeRobot)
+- [ ] Error tracking (e.g. Sentry) to catch and alert on production exceptions
+- [ ] Audit log table for critical mutations (order status changes, capacity overrides)
+
+---
+
+## 14. Next Steps
 
 - [x] Resolve all design questions
 - [ ] Scaffold FastAPI project (SQLAlchemy models, Alembic, JWT auth with company context)
 - [ ] Implement `auth_service` — login → company list → scoped JWT
 - [ ] Implement `schedule_service` — window generation + mixed-cart capacity enforcement
-- [ ] Set up Railway + PostgreSQL
-- [ ] Integrate Resend for order confirmation email
+- [ ] Build platform admin dashboard (company onboarding, billing management)
+- [ ] Set up Railway + PostgreSQL with automated backups verified
+- [ ] Integrate Resend for order status notification emails
+- [ ] Set up Sentry for error tracking + UptimeRobot for health monitoring
 - [ ] Build OpenAPI schema, share with web + iOS teams
 - [ ] Future: online payment (Stripe), per-company email branding, multi-location
