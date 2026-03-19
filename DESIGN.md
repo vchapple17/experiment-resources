@@ -669,18 +669,43 @@ Using Supabase for both database and auth consolidates two infrastructure concer
 one platform and one bill. Supabase Pro includes daily backups, no project pausing,
 and 8GB database storage.
 
+### Supabase as Database
+
+Supabase exposes a standard PostgreSQL connection string — Alembic and SQLAlchemy
+connect to it exactly like any other Postgres instance.
+
+**Two connection modes (both provided in the Supabase dashboard):**
+
+| Mode | Use for | Why |
+|---|---|---|
+| **Direct connection** | Alembic migrations | Needs persistent connection; not pooled |
+| **Transaction pooler** (PgBouncer port 6543) | FastAPI app at runtime | Handles many short-lived async connections efficiently |
+
+**Schema boundaries to respect:**
+- `auth.*` — Supabase-managed; never modify directly. Use hooks and policies instead.
+- `public.*` — your schema; Alembic owns and manages all migrations here.
+- `storage.*` — Supabase file storage; relevant if you add product image uploads later.
+
+**Key env vars:**
+```
+DATABASE_URL=postgresql+asyncpg://...@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+DATABASE_MIGRATION_URL=postgresql://...@db.<ref>.supabase.co:5432/postgres
+SUPABASE_JWT_SECRET=<from Supabase dashboard → Settings → API>
+RESEND_API_KEY=...
+```
+
 ### FastAPI on Railway
 
 - Connect GitHub repo → Railway auto-detects FastAPI
-- Set environment variables: `SUPABASE_URL`, `SUPABASE_JWT_SECRET`, `RESEND_API_KEY`
-- Alembic migrations run on deploy via a release command
+- Add env vars from above in Railway dashboard
+- Alembic migrations run against `DATABASE_MIGRATION_URL` on deploy via release command
 - Auto-deploys on push to `main`
 
 ### What You'll Need
 
 - `Dockerfile` or `railway.toml` (minimal for FastAPI)
-- Supabase project configured with custom JWT hook (Postgres function)
-- Alembic configured to point at Supabase's connection string
+- Supabase project (Pro plan) with custom JWT hook configured as a Postgres function
+- Alembic configured with both direct and pooled connection strings
 - Resend API key for order notification emails
 
 ### Total Monthly Cost at Launch
