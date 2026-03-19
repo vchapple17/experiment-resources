@@ -44,83 +44,107 @@ indicating which company context is active for that session.
 **Why not schema-per-tenant?** At this scale, row-level is simpler to operate and
 query. Migrating to schema-per-tenant later is possible but not needed now.
 
-### Authentication Provider: Clerk (recommended)
+### Authentication Provider: Supabase Auth
 
-[Clerk](https://clerk.com) is a managed auth service whose **Organizations** feature
-maps directly to this design:
+[Supabase Auth](https://supabase.com/docs/guides/auth) handles user registration,
+login, JWT issuance, and session management. It is open source (GoTrue), self-hostable,
+and has no per-user cost at this scale. Auth is kept intentionally simple — roles are
+global, not per-company, for now.
 
-| This design | Clerk concept |
-|---|---|
-| `companies` | Organizations |
-| `company_memberships` | Organization Memberships |
-| `company_id` in JWT | `o.id` claim (built into JWT v2) |
-| Role in JWT | `o.rol` claim (built into JWT v2) |
-| Company switcher UI | `<OrganizationSwitcher />` component |
+**Stack benefit:** If using Supabase for the PostgreSQL database as well, auth and
+data live in the same platform — one dashboard, one billing account, no separate
+Railway/Render setup needed.
 
-**FastAPI integration:** via `fastapi-clerk-auth` (PyPI, community-maintained) or
-manual JWKS verification with PyJWT. Clerk's own FastAPI example repo is available at
-`github.com/clerk/fastapi-example`.
+### JWT Structure
 
-**Roles strategy — cost trade-off:**
+Supabase issues standard JWTs (RS256). A `custom_access_token_hook` (a Postgres
+function) is used to inject role and company context at token issuance time:
 
-Clerk's built-in RBAC (custom roles beyond `admin`/`member`) requires the
-**Enhanced B2B SaaS add-on** at +$100/month on top of Pro ($25/month).
-
-**Recommended approach to avoid this cost:** Store role in
-`organizationMembership.publicMetadata` (`{ "role": "staff" }`) and surface it as a
-JWT claim via a Clerk JWT Template. Role enforcement lives in FastAPI middleware.
-This preserves full control at no add-on cost.
-
-**Pricing reality for this project:**
-
-| Tier | Cost | Limits |
-|---|---|---|
-| Free | $0 | 100 orgs, 50k users, **5 members/org max** |
-| Pro | $25/month | Removes member cap, 100 orgs included |
-| Pro + B2B add-on | $125/month | Adds Clerk-managed custom roles/permissions |
-| **Recommended** | **Pro ($25/month)** | Use metadata for roles, avoid add-on |
-
-**Other Clerk notes:**
-- JWT custom claims have ~1.2KB budget — be selective, don't embed whole metadata objects
-- Metadata role changes take up to ~60s to appear in existing JWTs (next refresh)
-- Webhooks available for all org/user/membership events via Svix (included free)
-- Sync Clerk org events to your DB via webhooks to keep `companies` + `company_memberships` tables as a local mirror
-
-### Company Context Flow
-
-```
-1. User visits jds-bakery.yourapp.com → slug identifies the company
-2. POST /auth/login (Clerk handles credential verification)
-   → Returns user + list of orgs (companies) they belong to
-3a. Single company → auto-select active org in Clerk session
-3b. Multiple companies → user picks via <OrganizationSwitcher />
-4. All JWTs carry: { sub: user_id, o.id: company_id, o.rol: role }
-5. FastAPI middleware extracts company_id + role, injects into request context
-6. Repository layer always filters by company_id
+```json
+{
+  "sub": "user-uuid",
+  "role": "staff",
+  "company_id": "company-uuid",
+  "iat": 1234567890,
+  "exp": 1234567890
+}
 ```
 
-### Customer Registration
+The hook queries `company_memberships` at login to determine the user's role and
+default company. When multi-tenancy is added later, this hook can be extended to
+support company selection and scoped tokens with minimal change.
 
-Customers register **per company** at that company's storefront URL
-(`jds-bakery.yourapp.com/register`). The slug is known at registration time and
-automatically assigns the `customer` role in `company_memberships`.
+### FastAPI Integration
 
-The same email address can exist as a customer at multiple companies — they are
-independent accounts per storefront. Staff/admin accounts are invited by the company
-admin, not self-registered.
+```python
+from jose import jwt, JWTError
+
+class JWTBearer(HTTPBearer):
+    async def __call__(self, request: Request):
+        credentials = await super().__call__(request)
+        return jwt.decode(
+            credentials.credentials,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="authenticated"
+        )
+
+# Protect a route
+@router.get("/orders")
+async def list_orders(claims: dict = Depends(JWTBearer())):
+    role = claims["role"]
+    company_id = claims["company_id"]
+```
+
+**Important:** Never use the Supabase `service_role` key in FastAPI routes — it
+bypasses all security. Only verify user JWTs.
+
+### Auth Flow
+
+```
+1. Customer visits jds-bakery.yourapp.com/register
+   → Supabase creates user, assigns customer role via hook
+   → company_memberships row inserted
+
+2. Staff/admin are invited by company admin
+   → Supabase sends magic link / email invite
+   → Role assigned in company_memberships on acceptance
+
+3. Login → Supabase issues JWT with role + company_id claims
+4. FastAPI middleware verifies JWT on every request
+5. Repository layer filters all queries by company_id from token
+```
 
 ### Roles
 
 | Role | Scope | Can do |
 |---|---|---|
-| `platform_admin` | Global | Manage all companies, users, billing; support access |
+| `platform_admin` | Global | Manage all companies, users, billing; full access |
 | `admin` | Company | Full company control — products, staff, schedules, orders |
 | `staff` | Company | Manage products, schedules, view/update orders |
 | `customer` | Company | Browse products, place and view own orders |
 
-A user's role is per-company (stored in `company_memberships` and mirrored in Clerk
-org membership metadata). The same person can be `admin` at one company and
-`customer` at another.
+Roles are stored in `company_memberships.role` and surfaced in the JWT via the
+custom hook. Role checks happen in FastAPI middleware — not in Supabase RLS for now,
+keeping complexity low.
+
+### Future: Adding Multi-Tenancy to Auth
+
+When a second company is onboarded:
+1. Extend the custom JWT hook to accept a `company_id` parameter at login
+2. Add a company-selection step after login (if user has multiple memberships)
+3. Re-issue a token scoped to the selected company
+4. No schema changes required — `company_id` is already on every table
+
+### Pricing
+
+| Plan | Cost | Limits |
+|---|---|---|
+| Free | $0 | 50,000 MAU — pauses after 7 days inactivity (dev only) |
+| **Pro** | **$25/month** | 100,000 MAU, no pausing, daily backups |
+
+**Recommendation: Pro ($25/month)** from day one in production. The free tier pauses
+inactive projects and is not suitable for a live app.
 
 ---
 
@@ -547,8 +571,8 @@ Ready items have no capacity check — they are added to the order freely.
 | 13 | Company naming | `legal_name`, `dba_name` (customer-facing), `internal_name` (platform admin only), `slug` (URL/subdomain) |
 | 14 | Platform admin onboarding | Dedicated super admin dashboard + `company_billing` table for billing/plan tracking |
 | 15 | Backup & recovery | Railway automated snapshots + transactional writes + idempotent generation (see Section 14) |
-| 16 | Auth provider | Clerk — Organizations map to companies; roles stored in org membership metadata to avoid $100/month add-on; Pro plan ($25/month) |
-| 17 | Customer registration | Per-company via storefront slug; same email can exist at multiple companies independently |
+| 16 | Auth provider | **Supabase Auth** — simple global roles via custom JWT hook; open source; no per-user cost; upgrade path to multi-tenant auth when needed |
+| 17 | Customer registration | Self-register at company storefront URL; assigned `customer` role via JWT hook |
 | 18 | Billing model | Flat monthly tiers (Trial free / Starter $29 / Pro $79); gated by staff seats, product count, template count |
 | 19 | Locations | Companies support multiple locations; products are company-level (shared); schedules and availability windows are per-location |
 | 20 | Template inheritance | Company defines default schedule template; locations can assign their own or inherit default |
@@ -593,7 +617,7 @@ app/
 │   ├── order_repo.py
 │   └── schedule_repo.py
 ├── services/
-│   ├── auth_service.py       # Login, company selection, JWT issuance
+│   ├── auth_service.py       # JWT verification middleware, role extraction
 │   ├── company_service.py    # Company + platform admin management
 │   ├── location_service.py   # Location CRUD, kill switch, product overrides
 │   ├── product_service.py
@@ -633,20 +657,40 @@ A single transactional email on order confirmation.
 
 ## 11. Deployment Recommendation
 
-**[Railway](https://railway.app)** — best fit for a small-business SaaS:
+### Recommended Stack
+
+| Service | Role | Cost |
+|---|---|---|
+| **Supabase** | PostgreSQL database + Auth | $25/month (Pro) |
+| **Railway** or **Render** | FastAPI application server | ~$5–10/month |
+| **Resend** | Transactional email | Free tier (3,000 emails/month) |
+
+Using Supabase for both database and auth consolidates two infrastructure concerns into
+one platform and one bill. Supabase Pro includes daily backups, no project pausing,
+and 8GB database storage.
+
+### FastAPI on Railway
+
+- Connect GitHub repo → Railway auto-detects FastAPI
+- Set environment variables: `SUPABASE_URL`, `SUPABASE_JWT_SECRET`, `RESEND_API_KEY`
+- Alembic migrations run on deploy via a release command
+- Auto-deploys on push to `main`
+
+### What You'll Need
+
+- `Dockerfile` or `railway.toml` (minimal for FastAPI)
+- Supabase project configured with custom JWT hook (Postgres function)
+- Alembic configured to point at Supabase's connection string
+- Resend API key for order notification emails
+
+### Total Monthly Cost at Launch
 
 | | |
 |---|---|
-| FastAPI | Auto-detected from repo, builds with no config |
-| PostgreSQL | One-click plugin, connection string injected automatically |
-| Deploys | Auto-deploy on push to main |
-| Env vars | Managed in Railway dashboard |
-| Cost | ~$5–20/month for this scale |
-
-**What you'll need:**
-- `Dockerfile` or `railway.toml` (minimal for FastAPI)
-- Alembic migration step on deploy
-- Resend/SendGrid API key as env var
+| Supabase Pro | $25 |
+| Railway (Hobby) | ~$5–10 |
+| Resend | $0 |
+| **Total** | **~$30–35/month** |
 
 ---
 
@@ -756,12 +800,14 @@ GET    /platform/orders                     # Cross-company order visibility (su
 ## 15. Next Steps
 
 - [x] Resolve all design questions
-- [ ] Scaffold FastAPI project (SQLAlchemy models, Alembic, JWT auth with company context)
-- [ ] Implement `auth_service` — login → company list → scoped JWT
-- [ ] Implement `schedule_service` — window generation + mixed-cart capacity enforcement
-- [ ] Build platform admin dashboard (company onboarding, billing management)
-- [ ] Set up Railway + PostgreSQL with automated backups verified
-- [ ] Integrate Resend for order status notification emails
+- [x] Select auth provider: Supabase Auth
+- [ ] Create Supabase project (Pro plan); configure custom JWT hook for role + company_id claims
+- [ ] Scaffold FastAPI project (SQLAlchemy + Alembic pointed at Supabase Postgres)
+- [ ] Implement JWT verification middleware using Supabase JWT secret
+- [ ] Implement `schedule_service` — window generation (per-location) + capacity enforcement
+- [ ] Build platform admin dashboard (company onboarding, billing management, promote/demote admins)
+- [ ] Set up Railway for FastAPI app server; wire Supabase env vars
+- [ ] Integrate Resend for order lifecycle notification emails
 - [ ] Set up Sentry for error tracking + UptimeRobot for health monitoring
 - [ ] Build OpenAPI schema, share with web + iOS teams
-- [ ] Future: online payment (Stripe), per-company email branding, multi-location
+- [ ] Future: online payment (Stripe), multi-tenant auth extension, per-company email branding
