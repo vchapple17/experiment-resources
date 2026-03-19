@@ -41,20 +41,70 @@ indicating which company context is active for that session.
 **Why not schema-per-tenant?** At this scale, row-level is simpler to operate and
 query. Migrating to schema-per-tenant later is possible but not needed now.
 
+### Authentication Provider: Clerk (recommended)
+
+[Clerk](https://clerk.com) is a managed auth service whose **Organizations** feature
+maps directly to this design:
+
+| This design | Clerk concept |
+|---|---|
+| `companies` | Organizations |
+| `company_memberships` | Organization Memberships |
+| `company_id` in JWT | `o.id` claim (built into JWT v2) |
+| Role in JWT | `o.rol` claim (built into JWT v2) |
+| Company switcher UI | `<OrganizationSwitcher />` component |
+
+**FastAPI integration:** via `fastapi-clerk-auth` (PyPI, community-maintained) or
+manual JWKS verification with PyJWT. Clerk's own FastAPI example repo is available at
+`github.com/clerk/fastapi-example`.
+
+**Roles strategy — cost trade-off:**
+
+Clerk's built-in RBAC (custom roles beyond `admin`/`member`) requires the
+**Enhanced B2B SaaS add-on** at +$100/month on top of Pro ($25/month).
+
+**Recommended approach to avoid this cost:** Store role in
+`organizationMembership.publicMetadata` (`{ "role": "staff" }`) and surface it as a
+JWT claim via a Clerk JWT Template. Role enforcement lives in FastAPI middleware.
+This preserves full control at no add-on cost.
+
+**Pricing reality for this project:**
+
+| Tier | Cost | Limits |
+|---|---|---|
+| Free | $0 | 100 orgs, 50k users, **5 members/org max** |
+| Pro | $25/month | Removes member cap, 100 orgs included |
+| Pro + B2B add-on | $125/month | Adds Clerk-managed custom roles/permissions |
+| **Recommended** | **Pro ($25/month)** | Use metadata for roles, avoid add-on |
+
+**Other Clerk notes:**
+- JWT custom claims have ~1.2KB budget — be selective, don't embed whole metadata objects
+- Metadata role changes take up to ~60s to appear in existing JWTs (next refresh)
+- Webhooks available for all org/user/membership events via Svix (included free)
+- Sync Clerk org events to your DB via webhooks to keep `companies` + `company_memberships` tables as a local mirror
+
 ### Company Context Flow
 
 ```
-1. POST /auth/login
-   → Returns: user info + list of companies user belongs to
-
-2a. Single company → auto-select, return scoped JWT
-2b. Multiple companies → client calls POST /auth/select-company/{company_id}
-    → Returns: scoped JWT with { user_id, company_id, role } claims
-
-3. All subsequent API calls use the scoped JWT
-   → Middleware extracts company_id and injects into request context
-   → Repository layer always filters by company_id
+1. User visits jds-bakery.yourapp.com → slug identifies the company
+2. POST /auth/login (Clerk handles credential verification)
+   → Returns user + list of orgs (companies) they belong to
+3a. Single company → auto-select active org in Clerk session
+3b. Multiple companies → user picks via <OrganizationSwitcher />
+4. All JWTs carry: { sub: user_id, o.id: company_id, o.rol: role }
+5. FastAPI middleware extracts company_id + role, injects into request context
+6. Repository layer always filters by company_id
 ```
+
+### Customer Registration
+
+Customers register **per company** at that company's storefront URL
+(`jds-bakery.yourapp.com/register`). The slug is known at registration time and
+automatically assigns the `customer` role in `company_memberships`.
+
+The same email address can exist as a customer at multiple companies — they are
+independent accounts per storefront. Staff/admin accounts are invited by the company
+admin, not self-registered.
 
 ### Roles
 
@@ -65,8 +115,9 @@ query. Migrating to schema-per-tenant later is possible but not needed now.
 | `staff` | Company | Manage products, schedules, view/update orders |
 | `customer` | Company | Browse products, place and view own orders |
 
-A user's role is per-company (stored in `company_memberships`). The same person can be
-`admin` at one company and `customer` at another.
+A user's role is per-company (stored in `company_memberships` and mirrored in Clerk
+org membership metadata). The same person can be `admin` at one company and
+`customer` at another.
 
 ---
 
@@ -418,7 +469,10 @@ Ready items have no capacity check — they are added to the order freely.
 | 8 | Multi-tenancy | Row-level; `company_id` on all tenant tables |
 | 13 | Company naming | `legal_name`, `dba_name` (customer-facing), `internal_name` (platform admin only), `slug` (URL/subdomain) |
 | 14 | Platform admin onboarding | Dedicated super admin dashboard + `company_billing` table for billing/plan tracking |
-| 15 | Backup & recovery | Railway automated snapshots + transactional writes + idempotent generation (see Section 13) |
+| 15 | Backup & recovery | Railway automated snapshots + transactional writes + idempotent generation (see Section 14) |
+| 16 | Auth provider | Clerk — Organizations map to companies; roles stored in org membership metadata to avoid $100/month add-on; Pro plan ($25/month) |
+| 17 | Customer registration | Per-company via storefront slug; same email can exist at multiple companies independently |
+| 18 | Billing model | Flat monthly tiers (Trial free / Starter $29 / Pro $79); gated by staff seats, product count, template count |
 | 9 | User–company relationship | Many-to-many via `company_memberships`; role is per-company |
 | 10 | Tenant identification | Scoped JWT with `company_id` + `role` claims |
 | 11 | Platform admin | `is_platform_admin` flag on `users`; separate `/platform/*` endpoints |
@@ -510,7 +564,43 @@ A single transactional email on order confirmation.
 
 ---
 
-## 12. Platform Admin — Company Onboarding
+## 12. Billing Model
+
+### Recommended: Flat Monthly Tiers
+
+Small business owners prefer predictable bills. A tiered flat-fee model is easiest
+to sell, explain, and enforce.
+
+| Plan | Price | Limits |
+|---|---|---|
+| **Trial** | Free, 30 days | Full features, 1 staff seat |
+| **Starter** | $29/month | Up to 3 staff, 50 active products, 1 schedule template |
+| **Pro** | $79/month | Unlimited staff, unlimited products, unlimited templates |
+
+### What Gets Gated by Plan
+
+Enforced server-side in a `plan_enforcement` middleware layer that checks
+`company_billing.plan` before allowing writes:
+
+| Feature | Trial | Starter | Pro |
+|---|---|---|---|
+| Active products | 50 | 50 | Unlimited |
+| Staff/admin seats | 1 | 3 | Unlimited |
+| Schedule templates | 1 | 1 | Unlimited |
+| Order history (months) | 3 | 12 | Unlimited |
+| Email notification customization | — | — | ✓ |
+| Analytics/reporting | — | — | ✓ |
+
+### Future Billing Infrastructure
+
+- **Stripe** for subscription management and invoicing (future epic)
+- `company_billing.stripe_customer_id` is already in the schema for when this is built
+- For now: manual invoicing tracked in `company_billing.notes`
+
+---
+
+## 13. Platform Admin — Company Onboarding
+
 
 > **TODO:** Build a dedicated super admin dashboard for onboarding and managing companies.
 
@@ -554,7 +644,7 @@ GET    /platform/orders                     # Cross-company order visibility (su
 
 ---
 
-## 13. Backup & Failure Recovery
+## 14. Backup & Failure Recovery
 
 > **TODO:** Define and implement backup strategy before going to production.
 
@@ -577,7 +667,7 @@ GET    /platform/orders                     # Cross-company order visibility (su
 
 ---
 
-## 14. Next Steps
+## 15. Next Steps
 
 - [x] Resolve all design questions
 - [ ] Scaffold FastAPI project (SQLAlchemy models, Alembic, JWT auth with company context)
