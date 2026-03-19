@@ -61,7 +61,8 @@ Represents a bakery item available for sale.
 | `description` | TEXT | |
 | `price_cents` | INTEGER | Stored in cents to avoid float issues |
 | `category_id` | UUID FK → `categories` | |
-| `is_active` | BOOLEAN | Controls visibility to customers |
+| `is_active` | BOOLEAN | Permanently removes product from menu when false |
+| `is_on_hold` | BOOLEAN | Temporarily hides from customers without deleting; staff can resume |
 | `image_url` | TEXT | |
 | `created_at` | TIMESTAMPTZ | |
 | `updated_at` | TIMESTAMPTZ | |
@@ -212,11 +213,13 @@ users
 
 #### Products (public + staff)
 ```
-GET    /products                  # List active products (with availability)
+GET    /products                  # List active, non-held products (customers)
+GET    /products?include_held=true # Include on-hold products [staff+]
 GET    /products/{id}             # Product detail
 POST   /products                  # Create product [staff+]
 PUT    /products/{id}             # Update product [staff+]
-DELETE /products/{id}             # Soft-deactivate [admin]
+PATCH  /products/{id}/hold        # Toggle is_on_hold [staff+]
+DELETE /products/{id}             # Soft-deactivate (is_active=false) [admin]
 ```
 
 #### Categories
@@ -302,17 +305,19 @@ On order cancellation: decrement `reserved_quantity` in the same transaction as 
 
 ---
 
-## 7. Open Questions / Decisions Needed
+## 7. Decisions Log
 
-| # | Question | Status | Impact |
-|---|---|---|---|
-| 1 | Are orders paid online or in-person? | **In-person** (online = future epic) | No payment provider needed now; `total_cents` is reference-only |
-| 2 | How are availability windows generated? | **Staff-triggered** via API; weekly template as the source of truth | No background job needed initially |
-| 3 | Single or multi-location? | **Single location** | No `location` entity needed |
-| 4 | Will there be a concept of "menu" that changes weekly/seasonally? | Open | May require date-scoped `is_active` on products |
-| 5 | Should customers receive email/SMS notifications on order status changes? | Open | Requires async notification service (e.g. SendGrid, Twilio) |
-| 6 | What is the deployment target (AWS, GCP, fly.io, etc.)? | Open | Affects infra choices and CI/CD |
-| 7 | Do staff need a separate admin UI or will they use the same frontend? | Open | May affect API design for staff endpoints |
+All questions resolved.
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Payment | In-person; online = future epic |
+| 2 | Availability window generation | Staff-triggered via API from weekly template |
+| 3 | Locations | Single location |
+| 4 | Menu changes | Staff can add products or toggle `is_on_hold`; no date-scoped visibility needed |
+| 5 | Notifications | Email confirmation only — sent when order is placed, includes pickup instructions |
+| 6 | Deployment | TBD; prefer low-ops, small-business-friendly (see Section 9) |
+| 7 | Admin UI | Single frontend, role-based routing (customer vs. staff/admin views) |
 
 ---
 
@@ -355,11 +360,56 @@ app/
 
 ---
 
-## 9. Next Steps
+## 9. Email Notifications
 
-- [ ] Resolve remaining open questions (Section 7, items 4–7)
-- [ ] Prototype the `schedule_service` — window generation + capacity enforcement transaction
-- [ ] Set up FastAPI + SQLAlchemy + Alembic scaffold
-- [ ] Define authentication strategy (JWT library, token expiry)
+A single transactional email is sent when a customer's order is confirmed.
+
+**Trigger:** `POST /orders` success → enqueue email task
+
+**Contents:**
+- Order summary (items, quantities, total)
+- Pickup window (date + time range)
+- What to expect next (pay at pickup, bring order confirmation number)
+- Contact info for changes/cancellations
+
+**Implementation (keep it simple):**
+- Use [SendGrid](https://sendgrid.com) or [Resend](https://resend.com) — both have generous free tiers
+- Send synchronously on order creation for now (no queue needed at this scale)
+- If the email fails, log the error but don't fail the order — order is the source of truth
+
+Future: status-change emails (e.g. "Your order is ready for pickup") can be added later.
+
+---
+
+## 10. Deployment Recommendation
+
+For a small business, **[Railway](https://railway.app)** or **[Render](https://render.com)** are the best fit:
+
+| Option | Why it's good for this project |
+|---|---|
+| **Railway** | One-click PostgreSQL + FastAPI deploy, auto-deploys from GitHub, simple pricing (~$5–20/mo) |
+| **Render** | Similar to Railway, free tier available, managed Postgres, easy SSL |
+| **fly.io** | Slightly more control, very cheap, good for containerized FastAPI |
+
+**Recommendation: Railway**
+- Connect GitHub repo → it detects FastAPI and builds automatically
+- Add a Postgres plugin with one click
+- Environment variables managed in their dashboard
+- No DevOps knowledge required
+
+**What you'll need:**
+- `Dockerfile` or `railway.toml` config (straightforward for FastAPI)
+- Alembic migrations run on deploy
+- SendGrid/Resend API key as an environment variable
+
+---
+
+## 11. Next Steps
+
+- [x] Resolve all open questions
+- [ ] Scaffold FastAPI project (structure, SQLAlchemy, Alembic, JWT auth)
+- [ ] Implement `schedule_service` — window generation + capacity enforcement transaction
+- [ ] Set up Railway deployment + PostgreSQL
+- [ ] Integrate transactional email (Resend or SendGrid) on order confirmation
 - [ ] Create OpenAPI schema and share with web + iOS frontend teams
 - [ ] Future epic: online payment (Stripe) integration
