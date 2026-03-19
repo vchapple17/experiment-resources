@@ -80,10 +80,14 @@ Each tenant on the platform.
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
-| `name` | VARCHAR(255) | e.g. "The Sourdough Co." |
-| `slug` | VARCHAR(100) UNIQUE | URL-safe identifier, e.g. `sourdough-co` |
+| `legal_name` | VARCHAR(255) | Registered legal entity, e.g. "John Doe, LLC" |
+| `dba_name` | VARCHAR(255) NULLABLE | Customer-facing trade name, e.g. "JD's Bakery" |
+| `internal_name` | VARCHAR(100) UNIQUE | Short identifier used by platform admin, e.g. "JDBAKERY" |
 | `is_active` | BOOLEAN | Platform admin can suspend a company |
 | `created_at` | TIMESTAMPTZ | |
+
+**Display name rule:** use `dba_name` if set, otherwise fall back to `legal_name`.
+The `internal_name` is never shown to customers or company staff — platform admin only.
 
 #### `users`
 Platform-level accounts. Role and company association live in `company_memberships`.
@@ -410,6 +414,7 @@ Ready items have no capacity check — they are added to the order freely.
 | 6 | Deployment | Railway recommended (see Section 11) |
 | 7 | Admin UI | Single frontend, role-based routing |
 | 8 | Multi-tenancy | Row-level; `company_id` on all tenant tables |
+| 13 | Company naming | Three fields: `legal_name`, `dba_name` (customer-facing), `internal_name` (platform admin only) |
 | 9 | User–company relationship | Many-to-many via `company_memberships`; role is per-company |
 | 10 | Tenant identification | Scoped JWT with `company_id` + `role` claims |
 | 11 | Platform admin | `is_platform_admin` flag on `users`; separate `/platform/*` endpoints |
