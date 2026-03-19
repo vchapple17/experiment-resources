@@ -1,7 +1,7 @@
 # Backend Service & Data Model Design
-## Bakery Ordering System — Capacity-Constrained Product Management
+## Multi-Tenant SaaS — Capacity-Constrained Ordering Platform
 
-**Status:** Draft — v2
+**Status:** Draft — v3
 **Date:** 2026-03-19
 **Stack:** Python (FastAPI), PostgreSQL, Service + Repository pattern
 
@@ -9,41 +9,64 @@
 
 ## 1. Overview
 
-A backend REST API for a bakery that sells products online (web + iOS). Unlike a
-standard e-commerce system, product availability is **capacity-constrained** —
-only a finite number of items can be produced per time window based on available
-oven time, counter space, and staffing. Orders and listings must respect these
-capacity limits.
+A multi-tenant SaaS backend where each **company** (tenant) runs its own ordering
+storefront. Companies sell products in two modes:
+
+- **Ready** — items always available; no production constraint (e.g. packaged goods,
+  pre-made items stocked on a shelf)
+- **Made-to-order** — capacity-constrained; quantity per time window is limited by
+  production capacity (e.g. fresh-baked bread, custom cakes)
+
+An order can mix both product types. Ready items are added freely; made-to-order
+items require the customer to select an available pickup window.
 
 ### Goals
 
-- Manage a catalog of bakery products with rich metadata (price, description, images)
-- Define **capacity settings** that cap how many of each product can be offered per time window
-- Allow customers (web + mobile) to browse available inventory and place orders
-- Expose internal APIs for backend service integrations (inventory sync, reporting)
-- Enforce authentication and role-based access (customer vs. staff vs. admin)
+- Isolate each company's data, staff, products, schedules, and orders completely
+- Support a single user belonging to multiple companies (e.g. an owner with two shops)
+- Provide a platform-level admin role for the SaaS operator
+- Handle both ready and made-to-order products in the same order flow
+- Email confirmation on order placement
 
 ---
 
-## 2. Architecture
+## 2. Multi-Tenancy Design
+
+### Strategy: Row-Level Tenancy + Scoped JWT
+
+All tenant data lives in a single shared database. Every tenant-owned table has a
+`company_id` column. The authenticated user's JWT carries a `company_id` claim
+indicating which company context is active for that session.
+
+**Why not schema-per-tenant?** At this scale, row-level is simpler to operate and
+query. Migrating to schema-per-tenant later is possible but not needed now.
+
+### Company Context Flow
 
 ```
- iOS App  ──┐
-            │  HTTPS
- Web App  ──┼──────────▶  FastAPI Service  ──────▶  PostgreSQL
-            │                   │
- Services ──┘                   └──────────────────▶  (future) Redis cache
+1. POST /auth/login
+   → Returns: user info + list of companies user belongs to
+
+2a. Single company → auto-select, return scoped JWT
+2b. Multiple companies → client calls POST /auth/select-company/{company_id}
+    → Returns: scoped JWT with { user_id, company_id, role } claims
+
+3. All subsequent API calls use the scoped JWT
+   → Middleware extracts company_id and injects into request context
+   → Repository layer always filters by company_id
 ```
 
-### Layer Breakdown
+### Roles
 
-| Layer | Responsibility |
-|---|---|
-| **Router (Controller)** | HTTP routing, request validation (Pydantic), response serialization |
-| **Service** | Business logic, capacity enforcement, transaction orchestration |
-| **Repository** | All database access; no SQL in service/router layers |
-| **Models** | SQLAlchemy ORM models mapping to PostgreSQL tables |
-| **Schemas** | Pydantic models for request/response contracts |
+| Role | Scope | Can do |
+|---|---|---|
+| `platform_admin` | Global | Manage all companies, users, billing; support access |
+| `admin` | Company | Full company control — products, staff, schedules, orders |
+| `staff` | Company | Manage products, schedules, view/update orders |
+| `customer` | Company | Browse products, place and view own orders |
+
+A user's role is per-company (stored in `company_memberships`). The same person can be
+`admin` at one company and `customer` at another.
 
 ---
 
@@ -51,40 +74,81 @@ capacity limits.
 
 ### 3.1 Core Entities
 
-#### `products`
-Represents a bakery item available for sale.
+#### `companies`
+Each tenant on the platform.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
-| `name` | VARCHAR(255) | e.g. "Sourdough Loaf" |
+| `name` | VARCHAR(255) | e.g. "The Sourdough Co." |
+| `slug` | VARCHAR(100) UNIQUE | URL-safe identifier, e.g. `sourdough-co` |
+| `is_active` | BOOLEAN | Platform admin can suspend a company |
+| `created_at` | TIMESTAMPTZ | |
+
+#### `users`
+Platform-level accounts. Role and company association live in `company_memberships`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `email` | VARCHAR(255) UNIQUE | |
+| `hashed_password` | TEXT | |
+| `full_name` | VARCHAR(255) | |
+| `phone` | VARCHAR(50) NULLABLE | |
+| `is_platform_admin` | BOOLEAN | SaaS operator superuser |
+| `is_active` | BOOLEAN | |
+| `created_at` | TIMESTAMPTZ | |
+
+#### `company_memberships`
+Links users to companies with a role. A user can have one membership per company.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `user_id` | UUID FK → `users` | |
+| `company_id` | UUID FK → `companies` | |
+| `role` | ENUM(`admin`, `staff`, `customer`) | Role within this company |
+| `created_at` | TIMESTAMPTZ | |
+| — | UNIQUE(`user_id`, `company_id`) | One membership per company per user |
+
+#### `products`
+Tenant-scoped. Two types: ready-to-sell or made-to-order.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `company_id` | UUID FK → `companies` | Tenant scope |
+| `category_id` | UUID FK → `categories` NULLABLE | |
+| `name` | VARCHAR(255) | |
 | `description` | TEXT | |
-| `price_cents` | INTEGER | Stored in cents to avoid float issues |
-| `category_id` | UUID FK → `categories` | |
-| `is_active` | BOOLEAN | Permanently removes product from menu when false |
-| `is_on_hold` | BOOLEAN | Temporarily hides from customers without deleting; staff can resume |
-| `image_url` | TEXT | |
+| `price_cents` | INTEGER | Stored in cents |
+| `product_type` | ENUM(`ready`, `made_to_order`) | Controls ordering flow |
+| `is_active` | BOOLEAN | Permanently removed when false |
+| `is_on_hold` | BOOLEAN | Temporarily hidden; staff can resume |
+| `image_url` | TEXT NULLABLE | |
 | `created_at` | TIMESTAMPTZ | |
 | `updated_at` | TIMESTAMPTZ | |
 
 #### `categories`
-Groups products (e.g. Breads, Pastries, Cakes).
+Tenant-scoped groupings (e.g. Breads, Pastries, Beverages).
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
+| `company_id` | UUID FK → `companies` | |
 | `name` | VARCHAR(100) | |
-| `sort_order` | INTEGER | Display ordering |
+| `sort_order` | INTEGER | |
 
 #### `schedule_templates`
-Weekly repeating schedule that defines the bakery's default production windows.
-Staff configure this once; daily windows are generated from it automatically.
+Tenant-scoped weekly repeating production schedule. Applies only to `made_to_order`
+products.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
+| `company_id` | UUID FK → `companies` | |
 | `name` | VARCHAR(100) | e.g. "Standard Week", "Holiday Schedule" |
-| `is_active` | BOOLEAN | Only one template active at a time |
+| `is_active` | BOOLEAN | Only one active per company at a time |
 | `created_at` | TIMESTAMPTZ | |
 
 #### `schedule_template_slots`
@@ -97,36 +161,36 @@ One row per day-of-week + time block within a template.
 | `day_of_week` | SMALLINT | 0=Mon … 6=Sun |
 | `pickup_start` | TIME | e.g. `08:00` |
 | `pickup_end` | TIME | e.g. `12:00` |
-| `lead_time_hours` | INTEGER | Minimum hours before this slot opens for ordering |
+| `lead_time_hours` | INTEGER | Min hours ahead a customer must order |
 
 #### `product_slot_capacity`
-How many of each product can be produced for a given template slot.
-Decouples product capacity from the time slot definition.
+How many of each made-to-order product can be produced per template slot.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
 | `template_slot_id` | UUID FK → `schedule_template_slots` | |
-| `product_id` | UUID FK → `products` | |
+| `product_id` | UUID FK → `products` | Must be `made_to_order` type |
 | `max_quantity` | INTEGER | |
 
 #### `availability_windows`
-Concrete per-day instances generated from the active template.
-Staff can override `max_quantity` or mark a window `is_blocked` for holidays/closures.
+Concrete calendar-date instances generated from the active template.
+Staff can block a window (holiday) or adjust per day.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
+| `company_id` | UUID FK → `companies` | |
 | `template_slot_id` | UUID FK → `schedule_template_slots` NULLABLE | NULL if manually created |
-| `date` | DATE | The specific calendar date |
+| `date` | DATE | |
 | `pickup_start` | TIMESTAMPTZ | |
 | `pickup_end` | TIMESTAMPTZ | |
-| `is_blocked` | BOOLEAN | Staff can close a window (holiday, sold out early) |
+| `is_blocked` | BOOLEAN | Staff can close (holiday, early sellout) |
 | `created_at` | TIMESTAMPTZ | |
 
 #### `window_product_capacity`
-Per-product capacity for a specific availability window.
-Copied from `product_slot_capacity` at generation time; staff can override per day.
+Per-product, per-window capacity. Copied from `product_slot_capacity` at generation;
+staff can override per day.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -137,21 +201,22 @@ Copied from `product_slot_capacity` at generation time; staff can override per d
 | `reserved_quantity` | INTEGER | Atomically incremented on order placement |
 
 #### `orders`
-A customer's purchase of one or more products. Payment is collected in person.
+A customer's purchase. May contain both ready and made-to-order items.
+Payment collected in person.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
+| `company_id` | UUID FK → `companies` | |
 | `customer_id` | UUID FK → `users` | |
 | `status` | ENUM(`pending`, `confirmed`, `ready`, `completed`, `cancelled`) | |
-| `total_cents` | INTEGER | Calculated at order time; reference only until in-person payment |
-| `notes` | TEXT NULLABLE | Special instructions |
-| `pickup_window_id` | UUID FK → `availability_windows` | The chosen pickup window |
+| `total_cents` | INTEGER | Reference only until in-person payment |
+| `notes` | TEXT NULLABLE | Customer special instructions |
+| `pickup_window_id` | UUID FK → `availability_windows` NULLABLE | Required when order has made-to-order items |
 | `created_at` | TIMESTAMPTZ | |
 | `updated_at` | TIMESTAMPTZ | |
 
 #### `order_items`
-Line items within an order (many-to-many between orders and products).
 
 | Column | Type | Notes |
 |---|---|---|
@@ -159,257 +224,290 @@ Line items within an order (many-to-many between orders and products).
 | `order_id` | UUID FK → `orders` | |
 | `product_id` | UUID FK → `products` | |
 | `quantity` | INTEGER | |
-| `unit_price_cents` | INTEGER | Price locked at time of order |
+| `unit_price_cents` | INTEGER | Price locked at order time |
 
-#### `users`
-Customers and staff accounts.
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | UUID PK | |
-| `email` | VARCHAR(255) UNIQUE | |
-| `hashed_password` | TEXT | |
-| `role` | ENUM(`customer`, `staff`, `admin`) | |
-| `full_name` | VARCHAR(255) | |
-| `phone` | VARCHAR(50) NULLABLE | |
-| `is_active` | BOOLEAN | |
-| `created_at` | TIMESTAMPTZ | |
+---
 
 ### 3.2 Entity Relationship Summary
 
 ```
-schedule_templates ──< schedule_template_slots >──< product_slot_capacity
-                                │                            │
-                                ▼                            │ (copied at generation)
-                       availability_windows                  │
-                                │                            ▼
-                                └──────────< window_product_capacity >── products
-                                                                              │
-categories ──────────────────────────────────────────────────────────────────┤
-                                                                              │
-orders ──< order_items >──────────────────────────────────────────────────────┘
-  │
-users
+companies ──< company_memberships >── users
+    │
+    ├──< categories
+    │
+    ├──< products (type: ready | made_to_order)
+    │         │
+    ├──< schedule_templates
+    │         └──< schedule_template_slots >──< product_slot_capacity >── products
+    │                        │
+    │                        ▼ (generated)
+    └──< availability_windows >──< window_product_capacity >── products
+                   │
+              orders (pickup_window_id nullable)
+                │  └──< order_items >── products
+               users
 ```
-
-- `schedule_templates` → `schedule_template_slots`: one-to-many
-- `schedule_template_slots` → `product_slot_capacity`: one-to-many (one per product)
-- `schedule_template_slots` → `availability_windows`: one-to-many (one per calendar date)
-- `availability_windows` → `window_product_capacity`: one-to-many
-- `window_product_capacity` → `products`: many-to-one
-- `orders` → `availability_windows`: many-to-one
-- `orders` → `order_items`: one-to-many
-- `order_items` → `products`: many-to-one
 
 ---
 
-## 4. API Design
+## 4. Order Flow by Product Type
 
-### Authentication
-- JWT Bearer tokens (issued on login)
-- Role-based access: `customer` / `staff` / `admin`
+### Ready products only
+1. Customer adds ready items to cart, submits order
+2. No pickup window required
+3. Order created immediately, confirmation email sent
+4. Staff marks order ready/completed at counter
 
-### Endpoint Groups
+### Made-to-order products (or mixed cart)
+1. Customer adds items (ready + made-to-order)
+2. Frontend shows available `availability_windows` for the made-to-order items
+3. Customer selects a window; order submitted with `pickup_window_id`
+4. Capacity check + atomic reservation (see Section 6)
+5. Confirmation email with pickup window details sent
 
-#### Products (public + staff)
-```
-GET    /products                  # List active, non-held products (customers)
-GET    /products?include_held=true # Include on-hold products [staff+]
-GET    /products/{id}             # Product detail
-POST   /products                  # Create product [staff+]
-PUT    /products/{id}             # Update product [staff+]
-PATCH  /products/{id}/hold        # Toggle is_on_hold [staff+]
-DELETE /products/{id}             # Soft-deactivate (is_active=false) [admin]
-```
+**Validation rule:** `pickup_window_id` is required if any `order_item.product.product_type == 'made_to_order'`.
 
-#### Categories
-```
-GET    /categories                # List all
-POST   /categories                # Create [staff+]
-```
+---
 
-#### Schedule Templates [staff+]
-```
-GET    /schedules                           # List templates
-POST   /schedules                           # Create a new template
-PUT    /schedules/{id}                      # Update template
-POST   /schedules/{id}/activate             # Set as active template
-GET    /schedules/{id}/slots                # List slots in a template
-POST   /schedules/{id}/slots                # Add a slot to template
-PUT    /schedules/{id}/slots/{slot_id}      # Update slot (time, lead time)
-POST   /schedules/{id}/slots/{slot_id}/capacity   # Set product capacity for slot
-```
+## 5. API Design
 
-#### Availability Windows
-```
-GET    /availability                        # Query windows by date range (public)
-POST   /availability/generate               # Generate windows from active template [staff+]
-PATCH  /availability/{id}                   # Override a specific day (block, adjust qty) [staff+]
-GET    /availability/{id}/capacity          # Per-product capacity for a window
-PATCH  /availability/{id}/capacity/{product_id}  # Override product qty for one day [staff+]
-```
+### Tenant Scoping
+All endpoints (except auth and platform admin) operate within the company context
+extracted from the JWT's `company_id` claim. No `company_id` parameter is needed
+in request bodies — it is injected server-side.
 
-#### Orders
+### Auth
 ```
-GET    /orders                    # Customer: own orders. Staff: all orders
-POST   /orders                    # Place an order
-GET    /orders/{id}               # Order detail
-PATCH  /orders/{id}/status        # Update status [staff+]
-DELETE /orders/{id}               # Cancel order
-```
-
-#### Auth
-```
-POST   /auth/register
-POST   /auth/login
+POST   /auth/register                    # Create account (no company yet)
+POST   /auth/login                       # Returns user + company list
+POST   /auth/select-company/{company_id} # Exchange for scoped JWT
 POST   /auth/refresh
 ```
 
+### Companies (platform admin only)
+```
+GET    /platform/companies               # List all tenants
+POST   /platform/companies               # Create new company
+GET    /platform/companies/{id}
+PATCH  /platform/companies/{id}          # Suspend, rename
+GET    /platform/users                   # All platform users
+```
+
+### Company Onboarding / Members [admin]
+```
+GET    /company/profile                  # Current company details
+PATCH  /company/profile                  # Update name, slug
+GET    /company/members                  # List staff + customers
+POST   /company/members                  # Invite user by email
+PATCH  /company/members/{user_id}        # Change role
+DELETE /company/members/{user_id}        # Remove from company
+```
+
+### Products
+```
+GET    /products                          # Active, non-held (customers)
+GET    /products?include_held=true        # Include on-hold [staff+]
+GET    /products?type=ready               # Filter by product_type
+GET    /products?type=made_to_order
+GET    /products/{id}
+POST   /products                          # Create [staff+]
+PUT    /products/{id}                     # Update [staff+]
+PATCH  /products/{id}/hold                # Toggle is_on_hold [staff+]
+DELETE /products/{id}                     # Soft-deactivate [admin]
+```
+
+### Categories
+```
+GET    /categories
+POST   /categories                        # [staff+]
+PUT    /categories/{id}                   # [staff+]
+```
+
+### Schedule Templates [staff+]
+```
+GET    /schedules
+POST   /schedules
+PUT    /schedules/{id}
+POST   /schedules/{id}/activate
+GET    /schedules/{id}/slots
+POST   /schedules/{id}/slots
+PUT    /schedules/{id}/slots/{slot_id}
+POST   /schedules/{id}/slots/{slot_id}/capacity
+```
+
+### Availability Windows
+```
+GET    /availability                            # By date range (public)
+POST   /availability/generate                  # Generate from template [staff+]
+PATCH  /availability/{id}                      # Block/unblock day [staff+]
+GET    /availability/{id}/capacity
+PATCH  /availability/{id}/capacity/{product_id} # Override qty [staff+]
+```
+
+### Orders
+```
+GET    /orders                            # Customer: own. Staff: all company orders
+POST   /orders                            # Place order
+GET    /orders/{id}
+PATCH  /orders/{id}/status               # [staff+]
+DELETE /orders/{id}                      # Cancel
+```
+
 ---
 
-## 5. Availability Window Generation
+## 6. Availability Window Generation
 
-Staff trigger window generation weekly (or ahead of a holiday schedule change).
-The service materializes `availability_windows` + `window_product_capacity` rows
-from the currently active `schedule_template`.
+Staff trigger generation for a date range. The service materializes
+`availability_windows` + `window_product_capacity` rows from the company's
+active `schedule_template`.
 
 ```
-POST /availability/generate  { "from_date": "2026-03-24", "to_date": "2026-03-30" }
+POST /availability/generate
+{ "from_date": "2026-03-24", "to_date": "2026-03-30" }
 ```
 
 Logic:
-1. Fetch the active `schedule_template` and its slots.
-2. For each date in range, find the matching `day_of_week` slots.
-3. Skip dates that already have a window for that slot (idempotent).
+1. Fetch the company's active `schedule_template` and its slots.
+2. For each date in range, match by `day_of_week`.
+3. Skip dates already having a window for that slot (idempotent).
 4. Insert `availability_windows` + copy `product_slot_capacity` → `window_product_capacity`.
 
-Staff can then override any individual day via `PATCH /availability/{id}`.
-
 ---
 
-## 6. Capacity Enforcement Logic
+## 7. Capacity Enforcement Logic
 
-This is the most critical business rule in the system.
+Applies only to `made_to_order` items when an order is placed.
 
-When a customer places an order:
-
-1. Look up `window_product_capacity` rows for the chosen `pickup_window_id` + each product.
-2. Check: `max_quantity - reserved_quantity >= requested_quantity` for each item.
-3. Validate lead time: reject if `window.pickup_start < now() + lead_time_hours`.
-4. If all checks pass, within a single DB transaction:
-   - `UPDATE window_product_capacity SET reserved_quantity = reserved_quantity + ? WHERE id = ? AND (max_quantity - reserved_quantity) >= ?`
+1. Look up `window_product_capacity` for each made-to-order item in the order.
+2. Validate lead time: reject if `window.pickup_start < now() + lead_time_hours`.
+3. Within a single DB transaction:
+   - For each made-to-order item:
+     ```sql
+     UPDATE window_product_capacity
+     SET reserved_quantity = reserved_quantity + :qty
+     WHERE id = :id
+       AND company_id = :company_id
+       AND (max_quantity - reserved_quantity) >= :qty
+     ```
+   - If any UPDATE affects 0 rows → rollback → return `409 Conflict`.
    - Insert `order` + `order_items` rows.
-5. If the UPDATE affects 0 rows (race condition), return `409 Conflict`.
 
-On order cancellation: decrement `reserved_quantity` in the same transaction as the status update.
+On cancellation: decrement `reserved_quantity` in the same transaction as the status update.
+
+Ready items have no capacity check — they are added to the order freely.
 
 ---
 
-## 7. Decisions Log
-
-All questions resolved.
+## 8. Decisions Log
 
 | # | Question | Decision |
 |---|---|---|
 | 1 | Payment | In-person; online = future epic |
 | 2 | Availability window generation | Staff-triggered via API from weekly template |
-| 3 | Locations | Single location |
-| 4 | Menu changes | Staff can add products or toggle `is_on_hold`; no date-scoped visibility needed |
-| 5 | Notifications | Email confirmation only — sent when order is placed, includes pickup instructions |
-| 6 | Deployment | TBD; prefer low-ops, small-business-friendly (see Section 9) |
-| 7 | Admin UI | Single frontend, role-based routing (customer vs. staff/admin views) |
+| 3 | Locations | Single location per company |
+| 4 | Menu changes | `is_on_hold` for temporary holds; `is_active=false` for permanent removal |
+| 5 | Notifications | Order confirmation email only (pickup instructions included) |
+| 6 | Deployment | Railway recommended (see Section 11) |
+| 7 | Admin UI | Single frontend, role-based routing |
+| 8 | Multi-tenancy | Row-level; `company_id` on all tenant tables |
+| 9 | User–company relationship | Many-to-many via `company_memberships`; role is per-company |
+| 10 | Tenant identification | Scoped JWT with `company_id` + `role` claims |
+| 11 | Platform admin | `is_platform_admin` flag on `users`; separate `/platform/*` endpoints |
+| 12 | Product types | `ready` (no capacity) and `made_to_order` (capacity-constrained) |
 
 ---
 
-## 8. Project Structure (FastAPI)
+## 9. Project Structure (FastAPI)
 
 ```
 app/
 ├── main.py
 ├── core/
-│   ├── config.py          # Settings (env vars)
-│   ├── security.py        # JWT, password hashing
-│   └── database.py        # SQLAlchemy engine & session
-├── models/                # SQLAlchemy ORM models
-│   ├── product.py
-│   ├── order.py
+│   ├── config.py           # Settings (env vars)
+│   ├── security.py         # JWT, password hashing, company context
+│   └── database.py         # SQLAlchemy engine & session
+├── models/
+│   ├── company.py          # companies, company_memberships
 │   ├── user.py
-│   └── schedule.py        # schedule_templates, slots, availability_windows, capacity
-├── schemas/               # Pydantic request/response schemas
+│   ├── product.py          # products, categories
+│   ├── order.py            # orders, order_items
+│   └── schedule.py         # templates, slots, windows, capacity
+├── schemas/
+│   ├── company.py
+│   ├── user.py
 │   ├── product.py
 │   ├── order.py
-│   ├── schedule.py
-│   └── user.py
-├── repositories/          # All DB queries live here
+│   └── schedule.py
+├── repositories/
+│   ├── company_repo.py
+│   ├── user_repo.py
 │   ├── product_repo.py
 │   ├── order_repo.py
 │   └── schedule_repo.py
-├── services/              # Business logic
+├── services/
+│   ├── auth_service.py       # Login, company selection, JWT issuance
+│   ├── company_service.py
 │   ├── product_service.py
-│   ├── order_service.py
-│   └── schedule_service.py  # window generation + capacity enforcement
-├── routers/               # FastAPI route definitions
+│   ├── order_service.py      # Handles mixed ready + made-to-order carts
+│   └── schedule_service.py   # Window generation + capacity enforcement
+├── routers/
+│   ├── auth.py
+│   ├── platform.py           # Platform admin routes
+│   ├── company.py            # Company profile + member management
 │   ├── products.py
-│   ├── orders.py
 │   ├── categories.py
 │   ├── schedules.py
 │   ├── availability.py
-│   └── auth.py
-└── migrations/            # Alembic migrations
+│   └── orders.py
+└── migrations/               # Alembic
 ```
 
 ---
 
-## 9. Email Notifications
+## 10. Email Notifications
 
-A single transactional email is sent when a customer's order is confirmed.
-
-**Trigger:** `POST /orders` success → enqueue email task
+A single transactional email on order confirmation.
 
 **Contents:**
+- Company name + branding (company `name` in subject line)
 - Order summary (items, quantities, total)
-- Pickup window (date + time range)
-- What to expect next (pay at pickup, bring order confirmation number)
-- Contact info for changes/cancellations
+- Pickup window if made-to-order items are included
+- Next steps (pay at pickup, bring confirmation number)
+- Company contact info for changes/cancellations
 
-**Implementation (keep it simple):**
-- Use [SendGrid](https://sendgrid.com) or [Resend](https://resend.com) — both have generous free tiers
-- Send synchronously on order creation for now (no queue needed at this scale)
-- If the email fails, log the error but don't fail the order — order is the source of truth
-
-Future: status-change emails (e.g. "Your order is ready for pickup") can be added later.
+**Implementation:**
+- [Resend](https://resend.com) or [SendGrid](https://sendgrid.com) — both have free tiers
+- Send synchronously on order creation; log failure but don't fail the order
+- Each company can eventually have its own reply-to address (future)
 
 ---
 
-## 10. Deployment Recommendation
+## 11. Deployment Recommendation
 
-For a small business, **[Railway](https://railway.app)** or **[Render](https://render.com)** are the best fit:
+**[Railway](https://railway.app)** — best fit for a small-business SaaS:
 
-| Option | Why it's good for this project |
+| | |
 |---|---|
-| **Railway** | One-click PostgreSQL + FastAPI deploy, auto-deploys from GitHub, simple pricing (~$5–20/mo) |
-| **Render** | Similar to Railway, free tier available, managed Postgres, easy SSL |
-| **fly.io** | Slightly more control, very cheap, good for containerized FastAPI |
-
-**Recommendation: Railway**
-- Connect GitHub repo → it detects FastAPI and builds automatically
-- Add a Postgres plugin with one click
-- Environment variables managed in their dashboard
-- No DevOps knowledge required
+| FastAPI | Auto-detected from repo, builds with no config |
+| PostgreSQL | One-click plugin, connection string injected automatically |
+| Deploys | Auto-deploy on push to main |
+| Env vars | Managed in Railway dashboard |
+| Cost | ~$5–20/month for this scale |
 
 **What you'll need:**
-- `Dockerfile` or `railway.toml` config (straightforward for FastAPI)
-- Alembic migrations run on deploy
-- SendGrid/Resend API key as an environment variable
+- `Dockerfile` or `railway.toml` (minimal for FastAPI)
+- Alembic migration step on deploy
+- Resend/SendGrid API key as env var
 
 ---
 
-## 11. Next Steps
+## 12. Next Steps
 
-- [x] Resolve all open questions
-- [ ] Scaffold FastAPI project (structure, SQLAlchemy, Alembic, JWT auth)
-- [ ] Implement `schedule_service` — window generation + capacity enforcement transaction
-- [ ] Set up Railway deployment + PostgreSQL
-- [ ] Integrate transactional email (Resend or SendGrid) on order confirmation
-- [ ] Create OpenAPI schema and share with web + iOS frontend teams
-- [ ] Future epic: online payment (Stripe) integration
+- [x] Resolve all design questions
+- [ ] Scaffold FastAPI project (SQLAlchemy models, Alembic, JWT auth with company context)
+- [ ] Implement `auth_service` — login → company list → scoped JWT
+- [ ] Implement `schedule_service` — window generation + mixed-cart capacity enforcement
+- [ ] Set up Railway + PostgreSQL
+- [ ] Integrate Resend for order confirmation email
+- [ ] Build OpenAPI schema, share with web + iOS teams
+- [ ] Future: online payment (Stripe), per-company email branding, multi-location
