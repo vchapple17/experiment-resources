@@ -356,6 +356,312 @@ items. Payment collected in person.
 
 ---
 
+### 3.2 Supabase Auth Integration — `auth.users` vs `public.profiles`
+
+Supabase owns the `auth.users` table. You **cannot and should not** replicate its
+columns (email, password hash, created_at) into your own table — Supabase manages
+those. Instead, extend with a `public.profiles` table that has a 1:1 FK to
+`auth.users.id`.
+
+**Replace the `users` table above with:**
+
+#### `profiles` (extends Supabase `auth.users`)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | Must equal `auth.users.id` — no separate sequence |
+| `full_name` | VARCHAR(255) | |
+| `phone` | VARCHAR(50) NULLABLE | |
+| `is_platform_admin` | BOOLEAN DEFAULT false | SaaS operator superuser |
+| `is_active` | BOOLEAN DEFAULT true | Soft disable without deleting the auth account |
+| `created_at` | TIMESTAMPTZ DEFAULT now() | |
+
+**Why this matters:**
+- `email` lives in `auth.users` — query it via a JOIN or Supabase's admin API
+- `hashed_password` is Supabase's concern — never store it in `public`
+- The custom JWT hook reads `profiles.is_platform_admin` and `company_memberships.role`
+- A Postgres trigger on `auth.users` INSERT can auto-create the `profiles` row:
+
+```sql
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger AS $$
+BEGIN
+  INSERT INTO public.profiles (id, full_name)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'full_name', '')
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+```
+
+All foreign keys that previously referenced `users.id` now reference `profiles.id`
+(which is the same UUID as `auth.users.id`).
+
+---
+
+### 3.3 Enum Definitions
+
+All enums are PostgreSQL native `CREATE TYPE` — Alembic manages them.
+
+```sql
+CREATE TYPE product_type      AS ENUM ('ready', 'made_to_order');
+CREATE TYPE order_status      AS ENUM ('pending', 'confirmed', 'ready', 'completed', 'cancelled');
+CREATE TYPE membership_role   AS ENUM ('admin', 'staff', 'customer');
+CREATE TYPE billing_plan      AS ENUM ('trial', 'starter', 'pro');
+```
+
+SQLAlchemy mapping:
+```python
+import enum
+
+class ProductType(str, enum.Enum):
+    ready         = "ready"
+    made_to_order = "made_to_order"
+
+class OrderStatus(str, enum.Enum):
+    pending   = "pending"
+    confirmed = "confirmed"
+    ready     = "ready"
+    completed = "completed"
+    cancelled = "cancelled"
+
+class MembershipRole(str, enum.Enum):
+    admin    = "admin"
+    staff    = "staff"
+    customer = "customer"
+
+class BillingPlan(str, enum.Enum):
+    trial   = "trial"
+    starter = "starter"
+    pro     = "pro"
+```
+
+---
+
+### 3.4 Database Indexes
+
+Performance-critical indexes to create alongside the tables. All FKs should be
+indexed; the ones below are the query-path indexes beyond basic FK indexes.
+
+```sql
+-- Fast lookup of all locations for a company
+CREATE INDEX idx_locations_company_id ON locations (company_id);
+
+-- Fast lookup of a company's products; filter by type in app layer
+CREATE INDEX idx_products_company_id ON products (company_id);
+
+-- Fast lookup of active products for a storefront
+CREATE INDEX idx_products_company_active ON products (company_id, is_active, is_on_hold);
+
+-- Location product overrides
+CREATE INDEX idx_loc_product_overrides_location ON location_product_overrides (location_id);
+CREATE INDEX idx_loc_product_overrides_product  ON location_product_overrides (product_id);
+
+-- Availability windows: primary access pattern is by location + date range
+CREATE INDEX idx_avail_windows_location_date
+    ON availability_windows (location_id, date);
+
+-- Also filter by company_id for platform admin cross-location queries
+CREATE INDEX idx_avail_windows_company_date
+    ON availability_windows (company_id, date);
+
+-- Capacity lookup during order placement (hot path)
+CREATE INDEX idx_window_capacity_window ON window_product_capacity (window_id);
+CREATE INDEX idx_window_capacity_product ON window_product_capacity (product_id);
+
+-- Orders: customers view their own; staff view all company orders
+CREATE INDEX idx_orders_company_id   ON orders (company_id);
+CREATE INDEX idx_orders_customer_id  ON orders (customer_id);
+CREATE INDEX idx_orders_location_id  ON orders (location_id);
+CREATE INDEX idx_orders_window_id    ON orders (pickup_window_id) WHERE pickup_window_id IS NOT NULL;
+
+-- Company memberships: look up all companies a user belongs to (company switcher)
+CREATE INDEX idx_memberships_user_id    ON company_memberships (user_id);
+CREATE INDEX idx_memberships_company_id ON company_memberships (company_id);
+
+-- Schedule template slots
+CREATE INDEX idx_slots_template_day ON schedule_template_slots (template_id, day_of_week);
+```
+
+---
+
+### 3.5 SQLAlchemy Models (key entities)
+
+Using `DeclarativeBase`, `mapped_column`, and `Mapped` (SQLAlchemy 2.0 style).
+All models inherit a shared `Base` with `id`, `created_at`.
+
+```python
+# app/models/base.py
+import uuid
+from datetime import datetime
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import UUID
+
+class Base(DeclarativeBase):
+    pass
+
+class TimestampMixin:
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+```
+
+```python
+# app/models/company.py
+from sqlalchemy import String, Boolean, ForeignKey, Enum as SAEnum
+from sqlalchemy.orm import relationship
+from .base import Base, TimestampMixin
+import uuid
+
+class Company(Base, TimestampMixin):
+    __tablename__ = "companies"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    legal_name: Mapped[str] = mapped_column(String(255))
+    dba_name: Mapped[str | None] = mapped_column(String(255))
+    internal_name: Mapped[str] = mapped_column(String(100), unique=True)
+    slug: Mapped[str] = mapped_column(String(100), unique=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_accepting_orders: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    locations: Mapped[list["Location"]] = relationship(back_populates="company")
+    memberships: Mapped[list["CompanyMembership"]] = relationship(back_populates="company")
+
+    @property
+    def display_name(self) -> str:
+        return self.dba_name or self.legal_name
+```
+
+```python
+# app/models/product.py
+from sqlalchemy import String, Text, Integer, Boolean, ForeignKey, Enum as SAEnum
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from .base import Base, TimestampMixin
+from ..core.enums import ProductType
+import uuid
+
+class Product(Base, TimestampMixin):
+    __tablename__ = "products"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"), index=True)
+    category_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("categories.id"))
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text, default="")
+    price_cents: Mapped[int] = mapped_column(Integer)          # Never store floats for money
+    product_type: Mapped[ProductType] = mapped_column(SAEnum(ProductType))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_on_hold: Mapped[bool] = mapped_column(Boolean, default=False)
+    image_url: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+```
+
+```python
+# app/models/order.py
+from sqlalchemy import Integer, Text, ForeignKey, Enum as SAEnum
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from .base import Base, TimestampMixin
+from ..core.enums import OrderStatus
+import uuid
+
+class Order(Base, TimestampMixin):
+    __tablename__ = "orders"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("companies.id"), index=True)
+    location_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("locations.id"), index=True)
+    customer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), index=True)
+    pickup_window_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("availability_windows.id"))
+    status: Mapped[OrderStatus] = mapped_column(SAEnum(OrderStatus), default=OrderStatus.pending)
+    total_cents: Mapped[int] = mapped_column(Integer)
+    notes: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    order_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("orders.id"), index=True)
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("products.id"))
+    quantity: Mapped[int] = mapped_column(Integer)
+    unit_price_cents: Mapped[int] = mapped_column(Integer)   # Locked at order time
+```
+
+**Key conventions across all models:**
+- Money is always `INTEGER` cents — never `FLOAT` or `DECIMAL` for pricing
+- All PKs are `UUID` generated in Python (`uuid.uuid4()`), not database sequences
+- `updated_at` uses `onupdate=func.now()` — only on tables that are mutated after creation
+- `cascade="all, delete-orphan"` on `order.items` — deleting an order deletes its items
+- Soft deletes via `is_active` — no hard deletes on anything customer-visible
+
+---
+
+### 3.6 Capacity Reservation — Atomic SQL Pattern
+
+The hot path for order placement. The `window_product_capacity` row must be
+locked and updated atomically per `made_to_order` item.
+
+```python
+# app/repositories/schedule_repo.py (excerpt)
+
+async def reserve_capacity(
+    session: AsyncSession,
+    window_id: uuid.UUID,
+    product_id: uuid.UUID,
+    quantity: int,
+    company_id: uuid.UUID,
+) -> bool:
+    """
+    Atomically reserves capacity. Returns False if insufficient capacity.
+    Must be called inside the order placement transaction.
+    """
+    result = await session.execute(
+        text("""
+            UPDATE window_product_capacity
+            SET reserved_quantity = reserved_quantity + :qty
+            WHERE window_id = :window_id
+              AND product_id = :product_id
+              AND (max_quantity - reserved_quantity) >= :qty
+            RETURNING id
+        """),
+        {"qty": quantity, "window_id": window_id, "product_id": product_id},
+    )
+    return result.fetchone() is not None   # False → 409 Conflict
+
+
+async def release_capacity(
+    session: AsyncSession,
+    window_id: uuid.UUID,
+    product_id: uuid.UUID,
+    quantity: int,
+) -> None:
+    """Called when an order is cancelled."""
+    await session.execute(
+        text("""
+            UPDATE window_product_capacity
+            SET reserved_quantity = GREATEST(0, reserved_quantity - :qty)
+            WHERE window_id = :window_id AND product_id = :product_id
+        """),
+        {"qty": quantity, "window_id": window_id, "product_id": product_id},
+    )
+```
+
+`GREATEST(0, ...)` on release prevents reserved_quantity going negative if
+a cancellation races with a correction. The `RETURNING id` check on reserve is
+the concurrency lock — if two requests try to take the last unit simultaneously,
+only one UPDATE will find `>= qty` remaining and succeed.
+
+---
+
 ### 3.2 Entity Relationship Summary
 
 ```
@@ -579,6 +885,10 @@ Ready items have no capacity check — they are added to the order freely.
 | 21 | Product visibility | Locations can hide company products via `location_product_overrides`; cannot create location-only products |
 | 22 | Kill switch | Two-level: company (global) and location (local); both must be true to accept orders |
 | 23 | Platform admin management | Platform admins can promote/demote other platform admins via `/platform/users/{id}/promote` |
+| 24 | User table ownership | Supabase owns `auth.users`; we extend with `public.profiles` (id = auth.users.id). No `hashed_password` column. Auto-created via Postgres trigger on auth.users INSERT. |
+| 25 | Money storage | All prices and totals stored as `INTEGER` cents — never `FLOAT` or `DECIMAL`. Display layer divides by 100. |
+| 26 | PK strategy | All PKs are `UUID` generated in Python (`uuid4()`), not database sequences. Avoids ID enumeration and simplifies multi-region futures. |
+| 27 | Capacity release on cancel | `GREATEST(0, reserved_quantity - qty)` prevents negative reserved counts from race conditions on cancellation. |
 | 9 | User–company relationship | Many-to-many via `company_memberships`; role is per-company |
 | 10 | Tenant identification | Scoped JWT with `company_id` + `role` claims |
 | 11 | Platform admin | `is_platform_admin` flag on `users`; separate `/platform/*` endpoints |
