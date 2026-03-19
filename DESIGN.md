@@ -1,7 +1,7 @@
 # Backend Service & Data Model Design
 ## Bakery Ordering System — Capacity-Constrained Product Management
 
-**Status:** Draft
+**Status:** Draft — v2
 **Date:** 2026-03-19
 **Stack:** Python (FastAPI), PostgreSQL, Service + Repository pattern
 
@@ -75,44 +75,77 @@ Groups products (e.g. Breads, Pastries, Cakes).
 | `name` | VARCHAR(100) | |
 | `sort_order` | INTEGER | Display ordering |
 
-#### `capacity_settings`
-Defines how many of a product can be produced per time window.
-This is the core constraint that differentiates this system from standard e-commerce.
+#### `schedule_templates`
+Weekly repeating schedule that defines the bakery's default production windows.
+Staff configure this once; daily windows are generated from it automatically.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
+| `name` | VARCHAR(100) | e.g. "Standard Week", "Holiday Schedule" |
+| `is_active` | BOOLEAN | Only one template active at a time |
+| `created_at` | TIMESTAMPTZ | |
+
+#### `schedule_template_slots`
+One row per day-of-week + time block within a template.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `template_id` | UUID FK → `schedule_templates` | |
+| `day_of_week` | SMALLINT | 0=Mon … 6=Sun |
+| `pickup_start` | TIME | e.g. `08:00` |
+| `pickup_end` | TIME | e.g. `12:00` |
+| `lead_time_hours` | INTEGER | Minimum hours before this slot opens for ordering |
+
+#### `product_slot_capacity`
+How many of each product can be produced for a given template slot.
+Decouples product capacity from the time slot definition.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `template_slot_id` | UUID FK → `schedule_template_slots` | |
 | `product_id` | UUID FK → `products` | |
-| `window_type` | ENUM(`daily`, `weekly`, `slot`) | Granularity of the cap |
-| `max_quantity` | INTEGER | Max units producible in the window |
-| `lead_time_hours` | INTEGER | Minimum hours before pickup/delivery |
-| `active_from` | DATE | When this setting takes effect |
-| `active_until` | DATE NULLABLE | NULL = indefinite |
+| `max_quantity` | INTEGER | |
 
 #### `availability_windows`
-Concrete time slots when orders can be picked up or delivered.
-Generated from capacity settings, or manually managed by staff.
+Concrete per-day instances generated from the active template.
+Staff can override `max_quantity` or mark a window `is_blocked` for holidays/closures.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
+| `template_slot_id` | UUID FK → `schedule_template_slots` NULLABLE | NULL if manually created |
+| `date` | DATE | The specific calendar date |
+| `pickup_start` | TIMESTAMPTZ | |
+| `pickup_end` | TIMESTAMPTZ | |
+| `is_blocked` | BOOLEAN | Staff can close a window (holiday, sold out early) |
+| `created_at` | TIMESTAMPTZ | |
+
+#### `window_product_capacity`
+Per-product capacity for a specific availability window.
+Copied from `product_slot_capacity` at generation time; staff can override per day.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `window_id` | UUID FK → `availability_windows` | |
 | `product_id` | UUID FK → `products` | |
-| `window_start` | TIMESTAMPTZ | |
-| `window_end` | TIMESTAMPTZ | |
-| `max_quantity` | INTEGER | Copied from capacity setting at generation time |
-| `reserved_quantity` | INTEGER | Incremented as orders are placed |
+| `max_quantity` | INTEGER | Staff-overridable |
+| `reserved_quantity` | INTEGER | Atomically incremented on order placement |
 
 #### `orders`
-A customer's purchase of one or more products.
+A customer's purchase of one or more products. Payment is collected in person.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
 | `customer_id` | UUID FK → `users` | |
 | `status` | ENUM(`pending`, `confirmed`, `ready`, `completed`, `cancelled`) | |
-| `total_cents` | INTEGER | |
+| `total_cents` | INTEGER | Calculated at order time; reference only until in-person payment |
 | `notes` | TEXT NULLABLE | Special instructions |
-| `pickup_window_id` | UUID FK → `availability_windows` NULLABLE | |
+| `pickup_window_id` | UUID FK → `availability_windows` | The chosen pickup window |
 | `created_at` | TIMESTAMPTZ | |
 | `updated_at` | TIMESTAMPTZ | |
 
@@ -144,19 +177,28 @@ Customers and staff accounts.
 ### 3.2 Entity Relationship Summary
 
 ```
-categories ──< products >──< order_items >── orders ──< users
-                  │
-          capacity_settings
-                  │
-          availability_windows
+schedule_templates ──< schedule_template_slots >──< product_slot_capacity
+                                │                            │
+                                ▼                            │ (copied at generation)
+                       availability_windows                  │
+                                │                            ▼
+                                └──────────< window_product_capacity >── products
+                                                                              │
+categories ──────────────────────────────────────────────────────────────────┤
+                                                                              │
+orders ──< order_items >──────────────────────────────────────────────────────┘
+  │
+users
 ```
 
-- `categories` → `products`: one-to-many
-- `products` → `capacity_settings`: one-to-many (settings can change over time)
-- `products` → `availability_windows`: one-to-many
+- `schedule_templates` → `schedule_template_slots`: one-to-many
+- `schedule_template_slots` → `product_slot_capacity`: one-to-many (one per product)
+- `schedule_template_slots` → `availability_windows`: one-to-many (one per calendar date)
+- `availability_windows` → `window_product_capacity`: one-to-many
+- `window_product_capacity` → `products`: many-to-one
+- `orders` → `availability_windows`: many-to-one
 - `orders` → `order_items`: one-to-many
 - `order_items` → `products`: many-to-one
-- `orders` → `availability_windows`: many-to-one (multiple orders can share a window up to capacity)
 
 ---
 
@@ -183,16 +225,25 @@ GET    /categories                # List all
 POST   /categories                # Create [staff+]
 ```
 
-#### Capacity Settings
+#### Schedule Templates [staff+]
 ```
-GET    /products/{id}/capacity    # Get capacity settings for a product [staff+]
-POST   /products/{id}/capacity    # Add/update capacity setting [staff+]
+GET    /schedules                           # List templates
+POST   /schedules                           # Create a new template
+PUT    /schedules/{id}                      # Update template
+POST   /schedules/{id}/activate             # Set as active template
+GET    /schedules/{id}/slots                # List slots in a template
+POST   /schedules/{id}/slots                # Add a slot to template
+PUT    /schedules/{id}/slots/{slot_id}      # Update slot (time, lead time)
+POST   /schedules/{id}/slots/{slot_id}/capacity   # Set product capacity for slot
 ```
 
 #### Availability Windows
 ```
-GET    /availability              # Query available slots (by date range, product)
-POST   /availability/generate     # Generate windows from capacity settings [staff+]
+GET    /availability                        # Query windows by date range (public)
+POST   /availability/generate               # Generate windows from active template [staff+]
+PATCH  /availability/{id}                   # Override a specific day (block, adjust qty) [staff+]
+GET    /availability/{id}/capacity          # Per-product capacity for a window
+PATCH  /availability/{id}/capacity/{product_id}  # Override product qty for one day [staff+]
 ```
 
 #### Orders
@@ -213,39 +264,59 @@ POST   /auth/refresh
 
 ---
 
-## 5. Capacity Enforcement Logic
+## 5. Availability Window Generation
+
+Staff trigger window generation weekly (or ahead of a holiday schedule change).
+The service materializes `availability_windows` + `window_product_capacity` rows
+from the currently active `schedule_template`.
+
+```
+POST /availability/generate  { "from_date": "2026-03-24", "to_date": "2026-03-30" }
+```
+
+Logic:
+1. Fetch the active `schedule_template` and its slots.
+2. For each date in range, find the matching `day_of_week` slots.
+3. Skip dates that already have a window for that slot (idempotent).
+4. Insert `availability_windows` + copy `product_slot_capacity` → `window_product_capacity`.
+
+Staff can then override any individual day via `PATCH /availability/{id}`.
+
+---
+
+## 6. Capacity Enforcement Logic
 
 This is the most critical business rule in the system.
 
-When a customer adds items to an order:
+When a customer places an order:
 
-1. Look up the `availability_window` for the requested pickup time and product.
-2. Check: `max_quantity - reserved_quantity >= requested_quantity`
-3. If capacity is available, **atomically increment** `reserved_quantity` and create the order
-   (use a `SELECT ... FOR UPDATE` row lock or a database transaction with optimistic locking).
-4. If capacity is exceeded, return `409 Conflict` with a clear message.
+1. Look up `window_product_capacity` rows for the chosen `pickup_window_id` + each product.
+2. Check: `max_quantity - reserved_quantity >= requested_quantity` for each item.
+3. Validate lead time: reject if `window.pickup_start < now() + lead_time_hours`.
+4. If all checks pass, within a single DB transaction:
+   - `UPDATE window_product_capacity SET reserved_quantity = reserved_quantity + ? WHERE id = ? AND (max_quantity - reserved_quantity) >= ?`
+   - Insert `order` + `order_items` rows.
+5. If the UPDATE affects 0 rows (race condition), return `409 Conflict`.
 
-On order cancellation: decrement `reserved_quantity` accordingly.
-
-**Lead time validation:** Reject orders where `window_start < now() + lead_time_hours`.
-
----
-
-## 6. Open Questions / Decisions Needed
-
-| # | Question | Impact |
-|---|---|---|
-| 1 | Are orders paid online or in-person? | Determines if a payment provider (Stripe) is needed |
-| 2 | How are availability windows generated? Automated nightly job or staff-triggered? | Affects background task design |
-| 3 | Will there be a concept of "menu" that changes weekly/seasonally? | May require date-scoped product visibility |
-| 4 | Should customers receive email/SMS notifications on order status changes? | Requires async notification service |
-| 5 | Do we need multi-location support (multiple bakery locations)? | Adds `location` entity and complicates capacity model |
-| 6 | What is the deployment target (AWS, GCP, fly.io, etc.)? | Affects infra choices and CI/CD |
-| 7 | Do staff need a separate admin UI or will they use the same frontend? | May affect API design for staff endpoints |
+On order cancellation: decrement `reserved_quantity` in the same transaction as the status update.
 
 ---
 
-## 7. Project Structure (FastAPI)
+## 7. Open Questions / Decisions Needed
+
+| # | Question | Status | Impact |
+|---|---|---|---|
+| 1 | Are orders paid online or in-person? | **In-person** (online = future epic) | No payment provider needed now; `total_cents` is reference-only |
+| 2 | How are availability windows generated? | **Staff-triggered** via API; weekly template as the source of truth | No background job needed initially |
+| 3 | Single or multi-location? | **Single location** | No `location` entity needed |
+| 4 | Will there be a concept of "menu" that changes weekly/seasonally? | Open | May require date-scoped `is_active` on products |
+| 5 | Should customers receive email/SMS notifications on order status changes? | Open | Requires async notification service (e.g. SendGrid, Twilio) |
+| 6 | What is the deployment target (AWS, GCP, fly.io, etc.)? | Open | Affects infra choices and CI/CD |
+| 7 | Do staff need a separate admin UI or will they use the same frontend? | Open | May affect API design for staff endpoints |
+
+---
+
+## 8. Project Structure (FastAPI)
 
 ```
 app/
@@ -258,23 +329,25 @@ app/
 │   ├── product.py
 │   ├── order.py
 │   ├── user.py
-│   └── capacity.py
+│   └── schedule.py        # schedule_templates, slots, availability_windows, capacity
 ├── schemas/               # Pydantic request/response schemas
 │   ├── product.py
 │   ├── order.py
+│   ├── schedule.py
 │   └── user.py
 ├── repositories/          # All DB queries live here
 │   ├── product_repo.py
 │   ├── order_repo.py
-│   └── capacity_repo.py
+│   └── schedule_repo.py
 ├── services/              # Business logic
 │   ├── product_service.py
 │   ├── order_service.py
-│   └── capacity_service.py
+│   └── schedule_service.py  # window generation + capacity enforcement
 ├── routers/               # FastAPI route definitions
 │   ├── products.py
 │   ├── orders.py
 │   ├── categories.py
+│   ├── schedules.py
 │   ├── availability.py
 │   └── auth.py
 └── migrations/            # Alembic migrations
@@ -282,11 +355,11 @@ app/
 
 ---
 
-## 8. Next Steps
+## 9. Next Steps
 
-- [ ] Answer open questions (Section 6)
-- [ ] Finalize entity list and column details
-- [ ] Prototype the capacity enforcement service method
+- [ ] Resolve remaining open questions (Section 7, items 4–7)
+- [ ] Prototype the `schedule_service` — window generation + capacity enforcement transaction
 - [ ] Set up FastAPI + SQLAlchemy + Alembic scaffold
 - [ ] Define authentication strategy (JWT library, token expiry)
-- [ ] Create OpenAPI schema and share with frontend teams
+- [ ] Create OpenAPI schema and share with web + iOS frontend teams
+- [ ] Future epic: online payment (Stripe) integration
